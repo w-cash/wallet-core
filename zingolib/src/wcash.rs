@@ -32,7 +32,11 @@ const WCASH_TESTNET_GENESIS_DISPLAY: &str =
 const WCASH_TESTNET_STORAGE_NAMESPACE: &str = "wcashtestnet-v5";
 const PUBLIC_CONFIRMATIONS: u32 = 100;
 const DEFAULT_EXPIRY_DELTA: u32 = 40;
-const DEFAULT_LOCK_FOR_BLOCKS: u32 = 100;
+// A Wcash input reservation must not outlive the exact transaction that owns
+// it. At a synchronized tip equal to the transaction expiry height, that
+// transaction cannot enter the next block and the input can be selected for a
+// replacement without creating two simultaneously valid transactions.
+const DEFAULT_LOCK_FOR_BLOCKS: u32 = DEFAULT_EXPIRY_DELTA;
 const DEFAULT_COINBASE_INPUTS: usize = 100;
 const ALLOW_UNSAFE_REGTEST_CONFIRMATIONS: bool = false;
 
@@ -431,6 +435,26 @@ mod tests {
         assert_eq!(
             DEFAULT_COINBASE_INPUTS,
             wcash_wallet::MAX_COINBASE_SHIELDING_INPUTS
+        );
+    }
+
+    #[test]
+    fn wcash_input_reservation_ends_at_the_exact_transaction_expiry_tip() {
+        const TRANSACTION_TARGET_HEIGHT: u32 = 1_000;
+
+        let transaction_expiry_height = TRANSACTION_TARGET_HEIGHT
+            .checked_add(DEFAULT_EXPIRY_DELTA)
+            .unwrap();
+        let input_lock_expiry_height = TRANSACTION_TARGET_HEIGHT
+            .checked_add(DEFAULT_LOCK_FOR_BLOCKS)
+            .unwrap();
+        let exact_synchronized_tip = transaction_expiry_height;
+        let next_transaction_target = exact_synchronized_tip.checked_add(1).unwrap();
+
+        assert_eq!(input_lock_expiry_height, transaction_expiry_height);
+        assert!(
+            input_lock_expiry_height < next_transaction_target,
+            "the Wcash input must be selectable for the first block after its previous transaction expired"
         );
     }
 
