@@ -82,6 +82,7 @@ zcash_primitives = { version = "0.30.0", features = ["non-standard-fees"] }
 zcash_proofs = "0.30.0"
 zcash_protocol = "0.10.4" # public API (TODO: remove from public API)
 zcash_transparent = "0.10.0"
+wcash_wallet_core = { git = "https://github.com/w-cash/librustzcash.git", rev = "688dc1d2157b8bef431e5e6fe7b0acb90fc4b363" }
 
 ### Blockchain Protocol
 bip0039 = { version = "0.14", features = ["rand"] }

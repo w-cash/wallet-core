@@ -16,6 +16,7 @@ pub mod perspective;
 pub mod sync;
 pub mod utils;
 pub mod wallet;
+pub mod wcash;
 
 pub mod mixnet;
 

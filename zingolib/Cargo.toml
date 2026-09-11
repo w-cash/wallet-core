@@ -74,6 +74,7 @@ zcash_primitives = { workspace = true }
 zcash_proofs = { workspace = true }
 zcash_protocol = { workspace = true }
 zcash_transparent = { workspace = true }
+wcash_wallet_core = { workspace = true }
 zingo-memo = { workspace = true }
 zingo-netutils = { workspace = true }
 zingo-price = { workspace = true }
