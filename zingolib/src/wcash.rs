@@ -19,15 +19,18 @@ use thiserror::Error;
 use wcash_wallet::wallet_balance_with_confirmations;
 use wcash_wallet::{
     AttestedWcashClient, TransferRecipient, WalletNetwork, WalletRpcError, WalletServiceError,
-    active_pending_signed_transactions, create_signed_coinbase_shielding, create_signed_transfer,
-    initialize_wallet, inspect_signed_transaction, inspect_wallet, pending_signed_transactions,
+    active_pending_signed_transactions, confirmed_transaction_history,
+    create_signed_coinbase_shielding, create_signed_transfer, initialize_wallet,
+    inspect_signed_transaction, inspect_wallet, pending_signed_transactions,
     synchronize_wallet_cancellable, wallet_balance,
 };
 
 pub use wcash_wallet::{
-    BlockRef, BroadcastDisposition, BroadcastResult, InitializedWallet,
-    PendingSignedTransactionPage, SignedTransaction, StoredSignedTransaction, WalletBalanceSummary,
-    WalletInfo, WalletSyncCancellation,
+    BlockRef, BroadcastDisposition, BroadcastResult, ConfirmedTransaction,
+    ConfirmedTransactionDirection, ConfirmedTransactionHistory, ConfirmedTransactionKind,
+    InitializedWallet, MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE, PendingSignedTransactionPage,
+    SignedTransaction, StoredSignedTransaction, WalletBalanceSummary, WalletInfo,
+    WalletSyncCancellation,
 };
 
 const WCASH_TESTNET_TICKER: &str = "TWC";
@@ -301,6 +304,15 @@ impl WcashTestnetRuntime {
         wallet_balance(&self.wallet_path, WcashTestnet.network()).map_err(Into::into)
     }
 
+    /// Reads newest-first confirmed transaction metadata at the exact synchronized tip.
+    pub fn confirmed_transactions(
+        &self,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionHistory, WcashTestnetRuntimeError> {
+        confirmed_transaction_history(&self.wallet_path, WcashTestnet.network(), limit)
+            .map_err(Into::into)
+    }
+
     /// Reads the account's canonical receiving addresses.
     pub fn receive(&self) -> Result<WcashTestnetReceivers, WcashTestnetRuntimeError> {
         Self::inspect(&self.wallet_path).map(Into::into)
@@ -537,6 +549,15 @@ impl WcashRegtestRuntime {
             ALLOW_UNSAFE_LOCAL_CONFIRMATIONS,
         )
         .map_err(Into::into)
+    }
+
+    /// Reads newest-first confirmed transaction metadata at the exact synchronized tip.
+    pub fn confirmed_transactions(
+        &self,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionHistory, WcashRegtestRuntimeError> {
+        confirmed_transaction_history(&self.wallet_path, WcashRegtest.network(), limit)
+            .map_err(Into::into)
     }
 
     /// Reads the account's canonical local receiving addresses.
@@ -937,6 +958,10 @@ mod tests {
         let synchronized = runtime.sync(&cancellation).await.unwrap();
         assert!(synchronized.synchronized);
         assert_eq!(runtime.balance().unwrap(), synchronized);
+        let history = runtime
+            .confirmed_transactions(MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE)
+            .unwrap();
+        assert_eq!(history.exact_tip.height, synchronized.chain_tip_height);
         let active = runtime.active_pending_transactions(None, None, 1).unwrap();
         assert_eq!(
             active.exact_tip.map(|tip| tip.height),
