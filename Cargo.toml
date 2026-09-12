@@ -82,7 +82,7 @@ zcash_primitives = { version = "0.30.0", features = ["non-standard-fees"] }
 zcash_proofs = "0.30.0"
 zcash_protocol = "0.10.4" # public API (TODO: remove from public API)
 zcash_transparent = "0.10.0"
-wcash-wallet = { git = "https://github.com/w-cash/wolf.git", rev = "47c44cd2adab6e6aa911ac740450c62ab600b4f5" }
+wcash-wallet = { git = "https://github.com/w-cash/wolf.git", rev = "9a9c0668784117f116d5b69bdb3a090765092343" }
 
 ### Blockchain Protocol
 bip0039 = { version = "0.14", features = ["rand"] }
@@ -153,9 +153,9 @@ opt-level = 3
 # The wallet backend carries the reviewed Wcash transaction domains in these
 # crates. Cargo reads patch tables from the root workspace, so this workspace
 # repeats the backend's immutable source selection.
-pczt = { git = "https://github.com/w-cash/wolf.git", rev = "47c44cd2adab6e6aa911ac740450c62ab600b4f5" }
-zcash_primitives = { git = "https://github.com/w-cash/wolf.git", rev = "47c44cd2adab6e6aa911ac740450c62ab600b4f5" }
-zcash_protocol = { git = "https://github.com/w-cash/wolf.git", rev = "47c44cd2adab6e6aa911ac740450c62ab600b4f5" }
+pczt = { git = "https://github.com/w-cash/wolf.git", rev = "9a9c0668784117f116d5b69bdb3a090765092343" }
+zcash_primitives = { git = "https://github.com/w-cash/wolf.git", rev = "9a9c0668784117f116d5b69bdb3a090765092343" }
+zcash_protocol = { git = "https://github.com/w-cash/wolf.git", rev = "9a9c0668784117f116d5b69bdb3a090765092343" }
 # Ironwood (NU6.3) proto fields (CompactTx.ironwoodActions, TreeState.ironwoodTree,
 # ShieldedProtocol.ironwood, ChainMetadata.ironwoodCommitmentTreeSize). The rev is
 # upstream main after PR #5 merged the Ironwood protos; the crate version is still

@@ -15,15 +15,15 @@ use serde::Serialize;
 use thiserror::Error;
 use wcash_wallet::{
     AttestedWcashClient, TransferRecipient, WalletNetwork, WalletRpcError, WalletServiceError,
-    create_signed_coinbase_shielding, create_signed_transfer, initialize_wallet,
-    inspect_signed_transaction, inspect_wallet, pending_signed_transactions,
+    active_pending_signed_transactions, create_signed_coinbase_shielding, create_signed_transfer,
+    initialize_wallet, inspect_signed_transaction, inspect_wallet, pending_signed_transactions,
     synchronize_wallet_cancellable, wallet_balance,
 };
 
 pub use wcash_wallet::{
-    BroadcastDisposition, BroadcastResult, InitializedWallet, PendingSignedTransactionPage,
-    SignedTransaction, StoredSignedTransaction, WalletBalanceSummary, WalletInfo,
-    WalletSyncCancellation,
+    BlockRef, BroadcastDisposition, BroadcastResult, InitializedWallet,
+    PendingSignedTransactionPage, SignedTransaction, StoredSignedTransaction, WalletBalanceSummary,
+    WalletInfo, WalletSyncCancellation,
 };
 
 const WCASH_TESTNET_TICKER: &str = "TWC";
@@ -297,6 +297,28 @@ impl WcashTestnetRuntime {
         .map_err(Into::into)
     }
 
+    /// Lists only transactions that remain valid at an internally attested
+    /// exact wallet tip.
+    ///
+    /// `expected_tip` is an equality precondition for continuation pages, not
+    /// filtering authority. The backend always derives the canonical height
+    /// and hash from one locked SQLite snapshot.
+    pub fn active_pending_transactions(
+        &self,
+        expected_tip: Option<BlockRef>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> Result<PendingSignedTransactionPage, WcashTestnetRuntimeError> {
+        active_pending_signed_transactions(
+            &self.wallet_path,
+            WcashTestnet.network(),
+            expected_tip,
+            after_row_id,
+            limit,
+        )
+        .map_err(Into::into)
+    }
+
     /// Broadcasts exact signed bytes recovered from the wallet database.
     pub async fn broadcast_pending(
         &mut self,
@@ -503,6 +525,13 @@ mod tests {
         let synchronized = runtime.sync(&cancellation).await.unwrap();
         assert!(synchronized.synchronized);
         assert_eq!(runtime.balance().unwrap(), synchronized);
+        let active = runtime.active_pending_transactions(None, None, 1).unwrap();
+        assert_eq!(
+            active.exact_tip.map(|tip| tip.height),
+            Some(synchronized.chain_tip_height)
+        );
+        assert!(active.transactions.is_empty());
+        assert_eq!(active.next_after_row_id, None);
 
         drop(runtime);
         let (reopened, info) = WcashTestnetRuntime::open(PUBLIC_TESTNET_ENDPOINT, &wallet_path)
