@@ -5594,6 +5594,7 @@ dependencies = [
 name = "zingo-cli"
 version = "0.4.0"
 dependencies = [
+ "bip0039",
  "clap",
  "hex",
  "http",
@@ -5603,6 +5604,8 @@ dependencies = [
  "nonempty",
  "pepper-sync",
  "rustyline",
+ "secrecy",
+ "serde_json",
  "shellwords",
  "tempfile",
  "thiserror 2.0.19",

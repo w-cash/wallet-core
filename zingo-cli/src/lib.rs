@@ -15,6 +15,8 @@
 
 mod commands;
 mod examples;
+#[cfg(feature = "wcash")]
+mod wcash;
 
 // The retired clearnet server-selection sweep. Never compiled by default:
 // the feature is the explicit review act (2026-08-06 ruling) that
@@ -48,16 +50,29 @@ use crate::commands::RT;
 
 pub(crate) mod version;
 
+#[cfg(feature = "wcash")]
+const CLI_PRODUCT_NAME: &str = "Wcash Wallet";
+#[cfg(not(feature = "wcash"))]
+const CLI_PRODUCT_NAME: &str = "Zingo CLI";
+#[cfg(feature = "wcash")]
+const CLI_EXECUTABLE_NAME: &str = "wcash-cli";
+#[cfg(not(feature = "wcash"))]
+const CLI_EXECUTABLE_NAME: &str = "zingo-cli";
+
 /// Builds the clap `Command` definition for the CLI: the session's options
 /// followed by every dispatchable command, so a one-shot command parses
 /// into its typed form here, before any wallet work begins.
 pub fn build_clap_app() -> clap::Command {
     use clap::Subcommand as _;
 
-    let session_options = clap::Command::new("Zingo CLI").version(version::VERSION)
+    let session_options = clap::Command::new(CLI_PRODUCT_NAME).version(version::VERSION)
             .disable_help_subcommand(true)
             .arg(Arg::new("nosync")
-                .help("By default, zingo-cli will sync the wallet at startup. Pass --nosync to prevent the automatic sync at startup.")
+                .help(if cfg!(feature = "wcash") {
+                    "By default, wcash-cli will sync the wallet at startup. Pass --nosync to prevent the automatic sync at startup."
+                } else {
+                    "By default, zingo-cli will sync the wallet at startup. Pass --nosync to prevent the automatic sync at startup."
+                })
                 .long("nosync")
                 .short('n')
                 .action(clap::ArgAction::SetTrue))
@@ -76,9 +91,15 @@ pub fn build_clap_app() -> clap::Command {
                 .long("seed")
                 .value_name("SEED PHRASE")
                 .value_parser(parse_seed)
-                .help("Create a new wallet with the given 24-word seed phrase. Will fail if wallet already exists. \
+                .help(if cfg!(feature = "wcash") {
+                    "Create a new wallet with the given 24-word seed phrase. Will fail if wallet already exists. \
+A seed passed here is visible in this host's process list and shell history; export WCASH_SEED instead to \
+keep it to this process and its child."
+                } else {
+                    "Create a new wallet with the given 24-word seed phrase. Will fail if wallet already exists. \
 A seed passed here is visible in this host's process list and shell history; export ZINGO_SEED instead to \
-keep it to this process and its child."))
+keep it to this process and its child."
+                }))
             .arg(Arg::new("viewkey")
                 .long("viewkey")
                 .value_name("UFVK")
@@ -126,13 +147,21 @@ Server-Selection Sweep selects the sync indexer.")
             .arg(Arg::new("log-file")
                 .long("log-file")
                 .value_name("PATH")
-                .help("Path to the log file for interactive mode. Defaults to .zingo-cli/cli.log"));
-    commands::CliCommand::augment_subcommands(session_options)
-        .about(
-            "A command-line light wallet for Zcash. Runs the given command and exits, or \
-             starts the interactive prompt when given none.",
-        )
-        .long_about(None)
+                .help(if cfg!(feature = "wcash") {
+                    "Path to the log file for interactive mode. Defaults to .wcash-cli/cli.log"
+                } else {
+                    "Path to the log file for interactive mode. Defaults to .zingo-cli/cli.log"
+                }));
+    let command = commands::CliCommand::augment_subcommands(session_options)
+        .about(if cfg!(feature = "wcash") {
+            "Wcash Wallet. Runs the given command and exits, or starts the interactive prompt when given none."
+        } else {
+            "A command-line light wallet for Zcash. Runs the given command and exits, or starts the interactive prompt when given none."
+        })
+        .long_about(None);
+    #[cfg(feature = "wcash")]
+    let command = wcash::brand_clap_command(command);
+    command
 }
 
 /// A session option placed after the command, and the corrected invocation.
@@ -172,7 +201,7 @@ pub fn misplaced_session_option(args: &[String]) -> Option<String> {
     let corrected = |option: &str| {
         format!(
             "`{option}` is a session option and must come before the command.\n       \
-             try:  zingo-cli {option} {rest}",
+             try:  {CLI_EXECUTABLE_NAME} {option} {rest}",
             rest = args
                 .iter()
                 .skip(1)
@@ -205,6 +234,9 @@ pub fn misplaced_session_option(args: &[String]) -> Option<String> {
 
 /// The environment variable a seed phrase may arrive in, so a caller need
 /// not put it where the process list and the shell history can read it.
+#[cfg(feature = "wcash")]
+const SEED_ENV: &str = "WCASH_SEED";
+#[cfg(not(feature = "wcash"))]
 const SEED_ENV: &str = "ZINGO_SEED";
 
 /// The seed a session starts from: the flag when given, otherwise the
@@ -591,7 +623,11 @@ fn start_interactive(cli_config: &CliConfigTemplate, ch: CommandChannel) -> Exit
                     continue;
                 }
 
-                let command = match commands::parse_command_tokens(&tokens) {
+                #[cfg(not(feature = "wcash"))]
+                let parsed = commands::parse_command_tokens(&tokens);
+                #[cfg(feature = "wcash")]
+                let parsed = wcash::parse_command_tokens(&tokens);
+                let command = match parsed {
                     Ok(command) => command,
                     Err(rendered) => {
                         eprintln!("{rendered}");
@@ -968,7 +1004,7 @@ fn data_dir_from(matches: &clap::ArgMatches) -> PathBuf {
 /// `--forget-online` removes the record before the decision,
 /// `--remember-online` stores it, and a session with no consent anywhere
 /// runs offline behind a notice naming the ways online.
-#[cfg(feature = "nym")]
+#[cfg(all(feature = "nym", not(feature = "wcash")))]
 fn get_communications(matches: &clap::ArgMatches) -> std::io::Result<Communications> {
     let data_dir = data_dir_from(matches);
     if matches.get_flag("forget-online") {
@@ -1021,7 +1057,7 @@ fn get_communications(matches: &clap::ArgMatches) -> std::io::Result<Communicati
 /// acts refuse loudly rather than silently degrade, and a stored standing
 /// consent is reported as inert. `--forget-online` still works, so an
 /// opt-out build can retire a stored consent.
-#[cfg(not(feature = "nym"))]
+#[cfg(all(not(feature = "nym"), not(feature = "wcash")))]
 fn get_communications(matches: &clap::ArgMatches) -> std::io::Result<Communications> {
     let data_dir = data_dir_from(matches);
     if matches.get_flag("forget-online") {
@@ -1065,6 +1101,11 @@ fn get_communications(matches: &clap::ArgMatches) -> std::io::Result<Communicati
     } else {
         Communications::UnconsentedOffline
     })
+}
+
+#[cfg(feature = "wcash")]
+fn get_communications(matches: &clap::ArgMatches) -> std::io::Result<Communications> {
+    wcash::communications(matches)
 }
 
 /// All CLI-derived configuration needed to create a [`LightClient`] and
@@ -1183,7 +1224,8 @@ impl CliConfigTemplate {
         // command, so the command must be one that uses it. An offline-capable
         // command after `--online` is a contradiction the launch refuses
         // early, before any network or wallet work.
-        if matches.get_flag("online")
+        if cfg!(not(feature = "wcash"))
+            && matches.get_flag("online")
             && let Operations::NonInteractive { command } = &mode
             && !command.requires_online()
         {
@@ -1900,6 +1942,7 @@ fn sweep_refusal_notice(error: &zingolib::lightclient::select::ServerSelectionEr
 /// Falls back to the prefix-only salvage reader when the user asked for
 /// `recovery_info` but the wallet file cannot be fully parsed. The whole
 /// point of that command is to escape a wallet no current build can read.
+#[cfg(not(feature = "wcash"))]
 fn print_salvaged_recovery_info(
     cli_config: &CliConfigTemplate,
     startup_error: &std::io::Error,
@@ -1923,6 +1966,7 @@ fn print_salvaged_recovery_info(
     Ok(())
 }
 
+#[cfg(not(feature = "wcash"))]
 fn dispatch_command_or_start_interactive(
     cli_config: &CliConfigTemplate,
 ) -> std::io::Result<ExitCode> {
@@ -1947,6 +1991,13 @@ fn dispatch_command_or_start_interactive(
     }
 }
 
+#[cfg(feature = "wcash")]
+fn dispatch_command_or_start_interactive(
+    cli_config: &CliConfigTemplate,
+) -> std::io::Result<ExitCode> {
+    wcash::dispatch_command_or_start_interactive(cli_config)
+}
+
 /// Whether the CLI will start the interactive REPL, which it does when no
 /// command was given.
 fn is_interactive(matches: &clap::ArgMatches) -> bool {
@@ -1954,6 +2005,9 @@ fn is_interactive(matches: &clap::ArgMatches) -> bool {
 }
 
 /// Default log file directory.
+#[cfg(feature = "wcash")]
+const LOG_DIR: &str = ".wcash-cli";
+#[cfg(not(feature = "wcash"))]
 const LOG_DIR: &str = ".zingo-cli";
 /// Default log file name within the log directory.
 const LOG_FILE: &str = "cli.log";
@@ -2005,6 +2059,7 @@ pub fn init_tracing(matches: &clap::ArgMatches) {
 
 /// Reads the posture the parsed arguments imply without performing any
 /// consent act, for surfaces that render before startup.
+#[cfg(not(feature = "wcash"))]
 fn posture_preview(matches: &clap::ArgMatches) -> Communications {
     #[cfg(feature = "nym")]
     {
@@ -2032,6 +2087,11 @@ fn posture_preview(matches: &clap::ArgMatches) -> Communications {
     }
 }
 
+#[cfg(feature = "wcash")]
+fn posture_preview(matches: &clap::ArgMatches) -> Communications {
+    wcash::posture_preview(matches)
+}
+
 /// Returns help text if the parsed arguments indicate the `help` command,
 /// or `None` for all other modes. The caller is responsible for printing
 /// the text and exiting the process.
@@ -2039,10 +2099,12 @@ pub fn help_output(matches: &clap::ArgMatches) -> Option<String> {
     match get_mode_of_operation(matches) {
         Operations::NonInteractive {
             command: commands::CliCommand::Help { command: named },
-        } => Some(commands::format_help(
-            posture_preview(matches),
-            named.as_deref(),
-        )),
+        } => {
+            let help = commands::format_help(posture_preview(matches), named.as_deref());
+            #[cfg(feature = "wcash")]
+            let help = wcash::brand_help(help);
+            Some(help)
+        }
         _ => None,
     }
 }
@@ -2056,9 +2118,17 @@ pub fn help_output(matches: &clap::ArgMatches) -> Option<String> {
 /// handling the help short-circuit, process-level setup, and error reporting.
 pub fn run_cli(matches: clap::ArgMatches) -> std::io::Result<ExitCode> {
     let mode = get_mode_of_operation(&matches);
-    if let Operations::NonInteractive { command } = &mode
-        && let Err(refusal) = command.validate_deferred_grammar()
-    {
+    #[cfg(not(feature = "wcash"))]
+    let grammar_result = match &mode {
+        Operations::NonInteractive { command } => command.validate_deferred_grammar(),
+        Operations::Interactive => Ok(()),
+    };
+    #[cfg(feature = "wcash")]
+    let grammar_result = match &mode {
+        Operations::NonInteractive { command } => wcash::validate_deferred_grammar(command),
+        Operations::Interactive => Ok(()),
+    };
+    if let Err(refusal) = grammar_result {
         eprintln!("{refusal}");
         return Ok(ExitCode::from(2));
     }

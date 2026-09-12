@@ -29,8 +29,8 @@ pub use wcash_wallet::{
     BlockRef, BroadcastDisposition, BroadcastResult, ConfirmedTransaction,
     ConfirmedTransactionDirection, ConfirmedTransactionHistory, ConfirmedTransactionKind,
     InitializedWallet, MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE, PendingSignedTransactionPage,
-    SignedTransaction, StoredSignedTransaction, WalletBalanceSummary, WalletInfo,
-    WalletSyncCancellation,
+    SignedTransaction, StoredSignedTransaction, WalletAddressError, WalletBalanceSummary,
+    WalletInfo, WalletSyncCancellation,
 };
 
 const WCASH_TESTNET_TICKER: &str = "TWC";
@@ -38,6 +38,7 @@ const WCASH_TESTNET_NETWORK_LABEL: &str = "Wcash Testnet";
 const WCASH_TESTNET_GENESIS_DISPLAY: &str =
     "0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a";
 const WCASH_TESTNET_STORAGE_NAMESPACE: &str = "wcashtestnet-v5";
+const WCASH_TESTNET_DEFAULT_ENDPOINT: &str = "https://wallet-testnet.wcashexplorer.com:443";
 const PUBLIC_CONFIRMATIONS: u32 = 100;
 #[cfg(feature = "regtest")]
 const REGTEST_CONFIRMATIONS: u32 = 1;
@@ -103,6 +104,16 @@ impl WcashTestnet {
         WCASH_TESTNET_STORAGE_NAMESPACE
     }
 
+    /// Returns the public compact-block endpoint for this profile.
+    pub const fn default_endpoint(self) -> &'static str {
+        WCASH_TESTNET_DEFAULT_ENDPOINT
+    }
+
+    /// Checks that an encoded recipient is canonical for Wcash Testnet and can receive Ironwood.
+    pub fn validate_recipient(self, address: &str) -> Result<(), WalletAddressError> {
+        wcash_wallet::decode_recipient(address, self.network()).map(drop)
+    }
+
     /// Returns the spend confirmation floor for this public network.
     pub const fn required_confirmations(self) -> u32 {
         PUBLIC_CONFIRMATIONS
@@ -154,6 +165,11 @@ impl WcashRegtest {
     /// Returns the one-block spend confirmation floor used by local QA.
     pub const fn required_confirmations(self) -> u32 {
         REGTEST_CONFIRMATIONS
+    }
+
+    /// Checks that an encoded recipient is canonical for Wcash Regtest and can receive Ironwood.
+    pub fn validate_recipient(self, address: &str) -> Result<(), WalletAddressError> {
+        wcash_wallet::decode_recipient(address, self.network()).map(drop)
     }
 }
 
@@ -301,7 +317,14 @@ impl WcashTestnetRuntime {
 
     /// Reads the current fail-closed pool-separated balance.
     pub fn balance(&self) -> Result<WalletBalanceSummary, WcashTestnetRuntimeError> {
-        wallet_balance(&self.wallet_path, WcashTestnet.network()).map_err(Into::into)
+        Self::read_balance(&self.wallet_path)
+    }
+
+    /// Reads a wallet balance without opening a network session.
+    pub fn read_balance(
+        wallet_path: impl AsRef<Path>,
+    ) -> Result<WalletBalanceSummary, WcashTestnetRuntimeError> {
+        wallet_balance(wallet_path, WcashTestnet.network()).map_err(Into::into)
     }
 
     /// Reads newest-first confirmed transaction metadata at the exact synchronized tip.
@@ -309,7 +332,15 @@ impl WcashTestnetRuntime {
         &self,
         limit: usize,
     ) -> Result<ConfirmedTransactionHistory, WcashTestnetRuntimeError> {
-        confirmed_transaction_history(&self.wallet_path, WcashTestnet.network(), limit)
+        Self::read_confirmed_transactions(&self.wallet_path, limit)
+    }
+
+    /// Reads confirmed transaction metadata without opening a network session.
+    pub fn read_confirmed_transactions(
+        wallet_path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionHistory, WcashTestnetRuntimeError> {
+        confirmed_transaction_history(wallet_path, WcashTestnet.network(), limit)
             .map_err(Into::into)
     }
 
@@ -542,8 +573,15 @@ impl WcashRegtestRuntime {
 
     /// Reads the current fail-closed pool-separated balance.
     pub fn balance(&self) -> Result<WalletBalanceSummary, WcashRegtestRuntimeError> {
+        Self::read_balance(&self.wallet_path)
+    }
+
+    /// Reads a local wallet balance without opening a network session.
+    pub fn read_balance(
+        wallet_path: impl AsRef<Path>,
+    ) -> Result<WalletBalanceSummary, WcashRegtestRuntimeError> {
         wallet_balance_with_confirmations(
-            &self.wallet_path,
+            wallet_path,
             WcashRegtest.network(),
             REGTEST_CONFIRMATIONS,
             ALLOW_UNSAFE_LOCAL_CONFIRMATIONS,
@@ -556,7 +594,15 @@ impl WcashRegtestRuntime {
         &self,
         limit: usize,
     ) -> Result<ConfirmedTransactionHistory, WcashRegtestRuntimeError> {
-        confirmed_transaction_history(&self.wallet_path, WcashRegtest.network(), limit)
+        Self::read_confirmed_transactions(&self.wallet_path, limit)
+    }
+
+    /// Reads confirmed local transaction metadata without opening a network session.
+    pub fn read_confirmed_transactions(
+        wallet_path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionHistory, WcashRegtestRuntimeError> {
+        confirmed_transaction_history(wallet_path, WcashRegtest.network(), limit)
             .map_err(Into::into)
     }
 
@@ -770,6 +816,9 @@ mod tests {
     const FILE_MODE_MASK: u32 = 0o777;
     const IRONWOOD_TESTNET_PREFIX: &str = "wutest1";
     const TRANSPARENT_TESTNET_PREFIX: &str = "WT";
+    const FIXED_TESTNET_RECIPIENT: &str = "wutest17mvne4ygv9v8rkjf6yxnrveceejh8nutee8svp8swkgj7s7ac9ga36u2av8hgpc28cc42u474ypjq2jsdt64utcxtztm2jr6guvaryhh";
+    #[cfg(feature = "regtest")]
+    const FIXED_REGTEST_RECIPIENT: &str = "wuregtest1xryxj7ddyajw4mv7jpelftnfhkwu3v5w03smp88kk6fkmfvlewpzrs26pxqs4wycul43485lg0h9ry8zzxkj9q8gvh7dmg0uh5e2t28k";
 
     #[test]
     fn profile_matches_the_frozen_wcash_testnet_identity() {
@@ -784,7 +833,9 @@ mod tests {
         );
         assert_eq!(profile.branch_id(), WCASH_TESTNET_BRANCH_ID);
         assert_eq!(profile.storage_namespace(), WCASH_TESTNET_STORAGE_NAMESPACE);
+        assert_eq!(profile.default_endpoint(), PUBLIC_TESTNET_ENDPOINT);
         assert_eq!(profile.required_confirmations(), PUBLIC_CONFIRMATIONS);
+        profile.validate_recipient(FIXED_TESTNET_RECIPIENT).unwrap();
     }
 
     #[cfg(feature = "regtest")]
@@ -808,6 +859,7 @@ mod tests {
         assert_eq!(profile.branch_id(), WCASH_REGTEST_BRANCH_ID);
         assert_eq!(profile.storage_namespace(), WCASH_REGTEST_STORAGE_NAMESPACE);
         assert_eq!(profile.required_confirmations(), REGTEST_CONFIRMATIONS);
+        profile.validate_recipient(FIXED_REGTEST_RECIPIENT).unwrap();
     }
 
     #[cfg(feature = "regtest")]
@@ -819,6 +871,16 @@ mod tests {
         assert_ne!(
             WcashRegtest.storage_namespace(),
             WcashTestnet.storage_namespace()
+        );
+        assert!(
+            WcashTestnet
+                .validate_recipient(FIXED_REGTEST_RECIPIENT)
+                .is_err()
+        );
+        assert!(
+            WcashRegtest
+                .validate_recipient(FIXED_TESTNET_RECIPIENT)
+                .is_err()
         );
     }
 
@@ -855,6 +917,21 @@ mod tests {
         assert!(matches!(
             error,
             WcashTestnetRuntimeError::Wallet(WalletServiceError::ForeignWalletDatabase)
+        ));
+        assert!(matches!(
+            WcashTestnetRuntime::read_balance(&wallet_path),
+            Err(WcashTestnetRuntimeError::Wallet(
+                WalletServiceError::ForeignWalletDatabase
+            ))
+        ));
+        assert!(matches!(
+            WcashTestnetRuntime::read_confirmed_transactions(
+                &wallet_path,
+                MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE
+            ),
+            Err(WcashTestnetRuntimeError::Wallet(
+                WalletServiceError::ForeignWalletDatabase
+            ))
         ));
     }
 
