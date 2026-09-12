@@ -2,6 +2,11 @@
 name = "zingo-cli"
 version = "0.4.0"
 edition = "2024"
+description = "Wcash Wallet CLI with the retained upstream Zingo CLI profile"
+authors = ["Wcash contributors", "ZingoLabs contributors"]
+repository = "https://github.com/w-cash/wallet-core"
+homepage = "https://github.com/w-cash/wallet-core"
+license = "MIT"
 
 [[bin]]
 name = "zingo-cli"
@@ -24,7 +29,14 @@ nym = ["zingolib/nym"]
 # Builds the unchanged command grammar over the Wcash application runtime.
 # Regtest is included for local QA. The default feature set remains the
 # upstream Zingo product.
-wcash = ["dep:bip0039", "dep:secrecy", "dep:serde_json", "zingolib/regtest"]
+wcash = [
+    "dep:bip0039",
+    "dep:keyring",
+    "dep:secrecy",
+    "dep:serde_json",
+    "dep:sha2",
+    "zingolib/regtest",
+]
 # The quarantined clearnet acts, compiled back in for testing and never for
 # use. Never a default: a session that goes online engages clearnet only for
 # sync, so compiling these back in is a deliberate, review-gated test act
@@ -46,8 +58,10 @@ zingo_common_components = { workspace = true }
 # ships nothing and creates no duplicate copy.
 zingolib = { workspace = true, features = ["perspective"] }
 bip0039 = { workspace = true, optional = true }
+keyring = { version = "4.2.0", optional = true }
 secrecy = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 zcash_address = { workspace = true }
 zcash_client_backend = { workspace = true }

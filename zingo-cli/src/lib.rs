@@ -63,6 +63,7 @@ const CLI_EXECUTABLE_NAME: &str = "zingo-cli";
 /// followed by every dispatchable command, so a one-shot command parses
 /// into its typed form here, before any wallet work begins.
 pub fn build_clap_app() -> clap::Command {
+    #[cfg(not(feature = "wcash"))]
     use clap::Subcommand as _;
 
     let session_options = clap::Command::new(CLI_PRODUCT_NAME).version(version::VERSION)
@@ -93,7 +94,7 @@ pub fn build_clap_app() -> clap::Command {
                 .value_parser(parse_seed)
                 .help(if cfg!(feature = "wcash") {
                     "Create a new wallet with the given 24-word seed phrase. Will fail if wallet already exists. \
-A seed passed here is visible in this host's process list and shell history; export WCASH_SEED instead to \
+A seed passed here is visible in this host's process list and shell history. Export WCASH_SEED instead to \
 keep it to this process and its child."
                 } else {
                     "Create a new wallet with the given 24-word seed phrase. Will fail if wallet already exists. \
@@ -152,16 +153,17 @@ Server-Selection Sweep selects the sync indexer.")
                 } else {
                     "Path to the log file for interactive mode. Defaults to .zingo-cli/cli.log"
                 }));
-    let command = commands::CliCommand::augment_subcommands(session_options)
+    #[cfg(not(feature = "wcash"))]
+    let command = commands::CliCommand::augment_subcommands(session_options);
+    #[cfg(feature = "wcash")]
+    let command = wcash::augment_commands(session_options);
+    command
         .about(if cfg!(feature = "wcash") {
             "Wcash Wallet. Runs the given command and exits, or starts the interactive prompt when given none."
         } else {
             "A command-line light wallet for Zcash. Runs the given command and exits, or starts the interactive prompt when given none."
         })
-        .long_about(None);
-    #[cfg(feature = "wcash")]
-    let command = wcash::brand_clap_command(command);
-    command
+        .long_about(None)
 }
 
 /// A session option placed after the command, and the corrected invocation.
@@ -1271,6 +1273,8 @@ impl CliConfigTemplate {
         }
         let chaintype = if let Some(chain) = matches.get_one::<String>("chain") {
             ChainType::try_from(chain.as_str()).map_err(ConfigTemplateError::from)?
+        } else if cfg!(feature = "wcash") {
+            ChainType::Testnet
         } else {
             ChainType::Mainnet
         };
@@ -2100,9 +2104,10 @@ pub fn help_output(matches: &clap::ArgMatches) -> Option<String> {
         Operations::NonInteractive {
             command: commands::CliCommand::Help { command: named },
         } => {
+            #[cfg(not(feature = "wcash"))]
             let help = commands::format_help(posture_preview(matches), named.as_deref());
             #[cfg(feature = "wcash")]
-            let help = wcash::brand_help(help);
+            let help = wcash::format_help(named.as_deref());
             Some(help)
         }
         _ => None,
@@ -2138,5 +2143,5 @@ pub fn run_cli(matches: clap::ArgMatches) -> std::io::Result<ExitCode> {
     dispatch_command_or_start_interactive(&cli_config)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "wcash")))]
 mod tests;

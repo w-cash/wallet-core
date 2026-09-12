@@ -19,18 +19,22 @@ use thiserror::Error;
 use wcash_wallet::wallet_balance_with_confirmations;
 use wcash_wallet::{
     AttestedWcashClient, TransferRecipient, WalletNetwork, WalletRpcError, WalletServiceError,
-    active_pending_signed_transactions, confirmed_transaction_history,
-    create_signed_coinbase_shielding, create_signed_transfer, initialize_wallet,
-    inspect_signed_transaction, inspect_wallet, pending_signed_transactions,
-    synchronize_wallet_cancellable, wallet_balance,
+    active_pending_signed_transactions, broadcast_calculated_transaction,
+    calculate_staged_transaction, cancel_staged_transaction, confirmed_transaction_history,
+    confirmed_transaction_summary_history, create_signed_coinbase_shielding,
+    create_signed_transfer, initialize_wallet, inspect_signed_transaction, inspect_wallet,
+    pending_signed_transactions, propose_coinbase_shielding_offline, propose_transfer_offline,
+    synchronize_wallet_cancellable, verify_wallet_seed, wallet_balance,
 };
 
 pub use wcash_wallet::{
-    BlockRef, BroadcastDisposition, BroadcastResult, ConfirmedTransaction,
+    BlockRef, BroadcastDisposition, BroadcastResult, CalculatedTransaction, ConfirmedTransaction,
     ConfirmedTransactionDirection, ConfirmedTransactionHistory, ConfirmedTransactionKind,
-    InitializedWallet, MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE, PendingSignedTransactionPage,
-    SignedTransaction, StoredSignedTransaction, WalletAddressError, WalletBalanceSummary,
-    WalletInfo, WalletSyncCancellation,
+    ConfirmedTransactionSummary, ConfirmedTransactionSummaryHistory, InitializedWallet,
+    MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE, MAX_PENDING_TRANSACTION_PAGE_SIZE,
+    PendingSignedTransactionPage, SignedTransaction, StagedTransactionProposal,
+    StoredSignedTransaction, WalletAddressError, WalletBalanceSummary, WalletInfo,
+    WalletSyncCancellation,
 };
 
 const WCASH_TESTNET_TICKER: &str = "TWC";
@@ -59,6 +63,8 @@ const WCASH_REGTEST_GENESIS_DISPLAY: &str =
     "70bf0bab17eff361a6331bb825b3b7253c8c96ff96407f948161d2912658bb1c";
 #[cfg(feature = "regtest")]
 const WCASH_REGTEST_STORAGE_NAMESPACE: &str = "wcashregtest-v5";
+#[cfg(feature = "regtest")]
+const WCASH_REGTEST_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:48234";
 #[cfg(feature = "regtest")]
 const ALLOW_UNSAFE_LOCAL_CONFIRMATIONS: bool = true;
 
@@ -114,6 +120,15 @@ impl WcashTestnet {
         wcash_wallet::decode_recipient(address, self.network()).map(drop)
     }
 
+    /// Confirms that a master seed controls the stored Testnet account.
+    pub fn verify_seed(
+        self,
+        wallet_path: impl AsRef<Path>,
+        master_seed: &SecretVec<u8>,
+    ) -> Result<(), WcashTestnetRuntimeError> {
+        verify_wallet_seed(wallet_path, self.network(), master_seed).map_err(Into::into)
+    }
+
     /// Returns the spend confirmation floor for this public network.
     pub const fn required_confirmations(self) -> u32 {
         PUBLIC_CONFIRMATIONS
@@ -162,6 +177,11 @@ impl WcashRegtest {
         WCASH_REGTEST_STORAGE_NAMESPACE
     }
 
+    /// Returns the fixed local QA endpoint for this profile.
+    pub const fn default_endpoint(self) -> &'static str {
+        WCASH_REGTEST_DEFAULT_ENDPOINT
+    }
+
     /// Returns the one-block spend confirmation floor used by local QA.
     pub const fn required_confirmations(self) -> u32 {
         REGTEST_CONFIRMATIONS
@@ -170,6 +190,15 @@ impl WcashRegtest {
     /// Checks that an encoded recipient is canonical for Wcash Regtest and can receive Ironwood.
     pub fn validate_recipient(self, address: &str) -> Result<(), WalletAddressError> {
         wcash_wallet::decode_recipient(address, self.network()).map(drop)
+    }
+
+    /// Confirms that a master seed controls the stored Regtest account.
+    pub fn verify_seed(
+        self,
+        wallet_path: impl AsRef<Path>,
+        master_seed: &SecretVec<u8>,
+    ) -> Result<(), WcashRegtestRuntimeError> {
+        verify_wallet_seed(wallet_path, self.network(), master_seed).map_err(Into::into)
     }
 }
 
@@ -344,6 +373,23 @@ impl WcashTestnetRuntime {
             .map_err(Into::into)
     }
 
+    /// Reads confirmed transaction metadata and wallet-display values.
+    pub fn confirmed_transaction_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionSummaryHistory, WcashTestnetRuntimeError> {
+        Self::read_confirmed_transaction_summaries(&self.wallet_path, limit)
+    }
+
+    /// Reads confirmed transaction metadata and values from wallet storage.
+    pub fn read_confirmed_transaction_summaries(
+        wallet_path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionSummaryHistory, WcashTestnetRuntimeError> {
+        confirmed_transaction_summary_history(wallet_path, WcashTestnet.network(), limit)
+            .map_err(Into::into)
+    }
+
     /// Reads the account's canonical receiving addresses.
     pub fn receive(&self) -> Result<WcashTestnetReceivers, WcashTestnetRuntimeError> {
         Self::inspect(&self.wallet_path).map(Into::into)
@@ -372,6 +418,55 @@ impl WcashTestnetRuntime {
         )
         .await
         .map_err(Into::into)
+    }
+
+    /// Selects and locks one Ironwood transfer using public wallet state.
+    pub fn propose_send(
+        wallet_path: impl AsRef<Path>,
+        payments: Vec<WcashTestnetPayment>,
+    ) -> Result<StagedTransactionProposal, WcashTestnetRuntimeError> {
+        propose_transfer_offline(
+            wallet_path,
+            WcashTestnet.network(),
+            payments.into_iter().map(Into::into).collect(),
+            PUBLIC_CONFIRMATIONS,
+            ALLOW_UNSAFE_REGTEST_CONFIRMATIONS,
+            DEFAULT_EXPIRY_DELTA,
+            DEFAULT_LOCK_FOR_BLOCKS,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Selects and locks mature transparent coinbase outputs.
+    pub fn propose_shield_coinbase(
+        wallet_path: impl AsRef<Path>,
+    ) -> Result<StagedTransactionProposal, WcashTestnetRuntimeError> {
+        propose_coinbase_shielding_offline(
+            wallet_path,
+            WcashTestnet.network(),
+            DEFAULT_COINBASE_INPUTS,
+            DEFAULT_EXPIRY_DELTA,
+            DEFAULT_LOCK_FOR_BLOCKS,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Signs the exact staged proposal using the local wallet state.
+    pub fn calculate(
+        wallet_path: impl AsRef<Path>,
+        master_seed: &SecretVec<u8>,
+        staged: &StagedTransactionProposal,
+    ) -> Result<CalculatedTransaction, WcashTestnetRuntimeError> {
+        calculate_staged_transaction(wallet_path, WcashTestnet.network(), master_seed, staged)
+            .map_err(Into::into)
+    }
+
+    /// Releases the input locks held by an abandoned Testnet proposal.
+    pub fn cancel(
+        wallet_path: impl AsRef<Path>,
+        staged: &StagedTransactionProposal,
+    ) -> Result<(), WcashTestnetRuntimeError> {
+        cancel_staged_transaction(wallet_path, WcashTestnet.network(), staged).map_err(Into::into)
     }
 
     /// Shields mature transparent coinbase outputs into Ironwood.
@@ -413,6 +508,16 @@ impl WcashTestnetRuntime {
             .map_err(Into::into)
     }
 
+    /// Revalidates and broadcasts the exact transaction returned by [`Self::calculate`].
+    pub async fn broadcast_calculated(
+        &mut self,
+        calculated: &CalculatedTransaction,
+    ) -> Result<BroadcastResult, WcashTestnetRuntimeError> {
+        broadcast_calculated_transaction(&mut self.client, calculated)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Lists signed bytes that can be recovered after an interrupted app call.
     pub fn pending_transactions(
         &self,
@@ -442,6 +547,23 @@ impl WcashTestnetRuntime {
     ) -> Result<PendingSignedTransactionPage, WcashTestnetRuntimeError> {
         active_pending_signed_transactions(
             &self.wallet_path,
+            WcashTestnet.network(),
+            expected_tip,
+            after_row_id,
+            limit,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Lists transactions valid at the exact wallet tip through a read-only local session.
+    pub fn read_active_pending_transactions(
+        wallet_path: impl AsRef<Path>,
+        expected_tip: Option<BlockRef>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> Result<PendingSignedTransactionPage, WcashTestnetRuntimeError> {
+        active_pending_signed_transactions(
+            wallet_path,
             WcashTestnet.network(),
             expected_tip,
             after_row_id,
@@ -606,6 +728,23 @@ impl WcashRegtestRuntime {
             .map_err(Into::into)
     }
 
+    /// Reads confirmed local transaction metadata and wallet-display values.
+    pub fn confirmed_transaction_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionSummaryHistory, WcashRegtestRuntimeError> {
+        Self::read_confirmed_transaction_summaries(&self.wallet_path, limit)
+    }
+
+    /// Reads confirmed local transaction metadata and values from wallet storage.
+    pub fn read_confirmed_transaction_summaries(
+        wallet_path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<ConfirmedTransactionSummaryHistory, WcashRegtestRuntimeError> {
+        confirmed_transaction_summary_history(wallet_path, WcashRegtest.network(), limit)
+            .map_err(Into::into)
+    }
+
     /// Reads the account's canonical local receiving addresses.
     pub fn receive(&self) -> Result<WcashRegtestReceivers, WcashRegtestRuntimeError> {
         Self::inspect(&self.wallet_path).map(Into::into)
@@ -634,6 +773,55 @@ impl WcashRegtestRuntime {
         )
         .await
         .map_err(Into::into)
+    }
+
+    /// Selects and locks one Ironwood transfer using public wallet state.
+    pub fn propose_send(
+        wallet_path: impl AsRef<Path>,
+        payments: Vec<WcashRegtestPayment>,
+    ) -> Result<StagedTransactionProposal, WcashRegtestRuntimeError> {
+        propose_transfer_offline(
+            wallet_path,
+            WcashRegtest.network(),
+            payments.into_iter().map(Into::into).collect(),
+            REGTEST_CONFIRMATIONS,
+            ALLOW_UNSAFE_LOCAL_CONFIRMATIONS,
+            DEFAULT_EXPIRY_DELTA,
+            DEFAULT_LOCK_FOR_BLOCKS,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Selects and locks mature transparent coinbase outputs.
+    pub fn propose_shield_coinbase(
+        wallet_path: impl AsRef<Path>,
+    ) -> Result<StagedTransactionProposal, WcashRegtestRuntimeError> {
+        propose_coinbase_shielding_offline(
+            wallet_path,
+            WcashRegtest.network(),
+            DEFAULT_COINBASE_INPUTS,
+            DEFAULT_EXPIRY_DELTA,
+            DEFAULT_LOCK_FOR_BLOCKS,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Signs the exact staged proposal using the local wallet state.
+    pub fn calculate(
+        wallet_path: impl AsRef<Path>,
+        master_seed: &SecretVec<u8>,
+        staged: &StagedTransactionProposal,
+    ) -> Result<CalculatedTransaction, WcashRegtestRuntimeError> {
+        calculate_staged_transaction(wallet_path, WcashRegtest.network(), master_seed, staged)
+            .map_err(Into::into)
+    }
+
+    /// Releases the input locks held by an abandoned Regtest proposal.
+    pub fn cancel(
+        wallet_path: impl AsRef<Path>,
+        staged: &StagedTransactionProposal,
+    ) -> Result<(), WcashRegtestRuntimeError> {
+        cancel_staged_transaction(wallet_path, WcashRegtest.network(), staged).map_err(Into::into)
     }
 
     /// Shields mature transparent coinbase outputs into Ironwood.
@@ -671,6 +859,16 @@ impl WcashRegtestRuntime {
             .map_err(Into::into)
     }
 
+    /// Revalidates and broadcasts the exact transaction returned by [`Self::calculate`].
+    pub async fn broadcast_calculated(
+        &mut self,
+        calculated: &CalculatedTransaction,
+    ) -> Result<BroadcastResult, WcashRegtestRuntimeError> {
+        broadcast_calculated_transaction(&mut self.client, calculated)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Lists signed bytes that can be recovered after an interrupted app call.
     pub fn pending_transactions(
         &self,
@@ -695,6 +893,23 @@ impl WcashRegtestRuntime {
     ) -> Result<PendingSignedTransactionPage, WcashRegtestRuntimeError> {
         active_pending_signed_transactions(
             &self.wallet_path,
+            WcashRegtest.network(),
+            expected_tip,
+            after_row_id,
+            limit,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Lists transactions valid at the exact wallet tip through a read-only local session.
+    pub fn read_active_pending_transactions(
+        wallet_path: impl AsRef<Path>,
+        expected_tip: Option<BlockRef>,
+        after_row_id: Option<u64>,
+        limit: usize,
+    ) -> Result<PendingSignedTransactionPage, WcashRegtestRuntimeError> {
+        active_pending_signed_transactions(
+            wallet_path,
             WcashRegtest.network(),
             expected_tip,
             after_row_id,

@@ -1,4 +1,40 @@
-# Zingo CLI
+# Wcash Wallet CLI
+
+The `wcash` Cargo feature builds `wcash-cli` from the upstream Zingo CLI source
+and command types.
+
+```bash
+cargo build --release -p zingo-cli --features wcash --bin wcash-cli
+./target/release/wcash-cli --online --chain testnet
+./target/release/wcash-cli --online --chain regtest
+```
+
+Testnet is the default. It uses
+`https://wallet-testnet.wcashexplorer.com:443` and
+`wcashtestnet-v5.sqlite3`. Regtest uses `http://127.0.0.1:48234` and
+`wcashregtest-v5.sqlite3`. The wallet database is stored under `--data-dir`, or
+under `wallets/` in the current directory. The selected profile fixes the endpoint.
+Wcash Mainnet is disabled until its consensus identity is frozen.
+
+The CLI stores the recovery phrase in Keychain Services on macOS, Windows
+Credential Manager on Windows, or Secret Service on a Linux desktop D-Bus
+session. Creation and signing return an error when the platform store cannot be
+opened. Credential storage is fail-closed and uses the selected platform
+service. On Linux, start the CLI in the logged-in desktop session with a Secret
+Service provider such as GNOME Keyring or KWallet.
+
+The supported wallet commands are `addresses`, `balance`, `birthday`,
+`calculate`, `confirm`, `height`, `help`, `quit`, `recovery_info`, `save`,
+`send`, `shield`, `sync run`, `t_addresses`, `transactions`, `version`, and
+`wallet_kind`. Run `send` or `shield`, then `calculate`, then `confirm` in the
+same interactive session. The first step selects a proposal from public wallet
+state. The second signs offline with the platform-stored phrase. The third
+broadcasts the exact calculated transaction after canonical-anchor checks.
+
+The remainder of this document describes the retained upstream `zingo-cli`
+profile built by the default feature set.
+
+# Upstream Zingo CLI
 
 A command-line light wallet for Zcash. `zingo-cli` either runs a single
 command and exits, or — given no command — starts an interactive prompt.

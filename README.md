@@ -1,3 +1,83 @@
+# Wcash Wallet Core
+
+This repository is the Wcash fork of
+[ZingoLabs/zingolib](https://github.com/zingolabs/zingolib). It retains the
+upstream Zingo wallet library and `zingo-cli`. The `wcash` Cargo feature adds
+the Wcash runtime and `wcash-cli` binary.
+
+The Wcash runtime uses the frozen Testnet and Regtest consensus identities,
+address encodings, transaction domain, and storage namespaces supplied by
+[`w-cash/wolf`](https://github.com/w-cash/wolf). Wcash Mainnet remains disabled
+until its consensus identity is frozen.
+
+## Build `wcash-cli`
+
+Prerequisites are Rust 1.90 or later, a C toolchain, SQLite development files,
+and `protoc`.
+
+```bash
+cargo build --release -p zingo-cli --features wcash --bin wcash-cli
+./target/release/wcash-cli --help
+```
+
+The default Wcash chain is Testnet. Regtest selects the local QA network.
+
+```bash
+./target/release/wcash-cli --online --chain testnet
+./target/release/wcash-cli --online --chain regtest
+```
+
+Endpoints are fixed by the selected profile:
+
+| Profile | Compact-block endpoint | Wallet file |
+| --- | --- | --- |
+| Testnet | `https://wallet-testnet.wcashexplorer.com:443` | `wcashtestnet-v5.sqlite3` |
+| Regtest | `http://127.0.0.1:48234` | `wcashregtest-v5.sqlite3` |
+
+Wallet files are placed under `--data-dir`, or under `wallets/` in the current
+directory. Database identity checks bind each file to its selected Wcash
+network.
+
+## Wallet and transaction flow
+
+The first online launch creates a wallet. The recovery phrase is shown once and
+saved in the operating system credential store. Restore with `WCASH_SEED` and a
+birthday height. A supplied phrase is checked against an existing wallet before
+the credential is updated.
+
+```bash
+WCASH_SEED='<24 words>' ./target/release/wcash-cli \
+  --online --chain testnet --birthday <height>
+```
+
+Run the staged transaction flow in one interactive session:
+
+```text
+send <wcash-address> <zatoshis> "optional memo"
+calculate
+confirm
+sync run
+transactions
+```
+
+`send` and `shield` select an exact proposal from public wallet state.
+`calculate` signs the current proposal offline. `confirm` revalidates its saved
+chain anchors and broadcasts those exact calculated bytes.
+
+## Credential stores
+
+`wcash-cli` uses Keychain Services on macOS, Windows Credential Manager on
+Windows, and Secret Service over the desktop D-Bus session on Linux. Wallet
+creation and signing fail with a platform credential-store error when that
+service is unavailable. Credential storage is fail-closed and uses the selected
+platform service.
+
+## Upstream Zingo documentation
+
+The upstream source, attribution, security reporting address, and MIT license
+remain in this fork. The documentation below applies to the retained
+`zingo-cli` profile.
+
 ## Zingolib
 [![license](https://img.shields.io/github/license/zingolabs/zingolib)](LICENSE) [![coverage](https://img.shields.io/endpoint?url=https://zingolabs.org/zingolib/coverage/badge.json)](https://zingolabs.org/zingolib/coverage/)
 This repo provides both a library for zingo-mobile, as well as an included cli application to interact with the Zcash blockchain through a chain indexer.

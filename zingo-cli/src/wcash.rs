@@ -1,12 +1,14 @@
 //! Wcash session routing for the upstream Zingo command surface.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::channel;
 
 use bip0039::{Count, English, Mnemonic};
-use secrecy::SecretVec;
+use secrecy::{ExposeSecret, SecretString, SecretVec};
+use sha2::{Digest, Sha256};
 use zcash_protocol::PoolType;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::memo::MemoBytes;
@@ -18,15 +20,18 @@ use zingolib::wallet::balance::AccountBalance;
 use zingolib::wallet::summary::data::{
     SendType, TransactionKind, TransactionSummaries, TransactionSummary,
 };
+#[cfg(test)]
+use zingolib::wcash::StoredSignedTransaction;
 use zingolib::wcash::{
-    BroadcastResult, ConfirmedTransactionDirection, ConfirmedTransactionHistory,
-    ConfirmedTransactionKind, InitializedWallet, MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE,
-    PendingSignedTransactionPage, SignedTransaction, StoredSignedTransaction, WalletBalanceSummary,
-    WalletInfo, WalletSyncCancellation, WcashRegtest, WcashRegtestRuntime, WcashTestnet,
-    WcashTestnetPayment, WcashTestnetRuntime,
+    BroadcastResult, CalculatedTransaction, ConfirmedTransactionDirection,
+    ConfirmedTransactionKind, ConfirmedTransactionSummaryHistory, InitializedWallet,
+    MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE, MAX_PENDING_TRANSACTION_PAGE_SIZE,
+    PendingSignedTransactionPage, StagedTransactionProposal, WalletBalanceSummary, WalletInfo,
+    WalletSyncCancellation, WcashRegtest, WcashRegtestRuntime, WcashTestnet, WcashTestnetPayment,
+    WcashTestnetRuntime,
 };
 
-use crate::commands::{CliCommand, RT, SyncSubCommand};
+use crate::commands::{CliCommand, RT, SaveSubCommand, SyncSubCommand};
 use crate::{
     CliConfigTemplate, CommandChannel, Communications, Operations, Request, offline_mode_refusal,
     start_interactive, start_noninteractive,
@@ -37,15 +42,164 @@ const ACCOUNT_INDEX: u32 = u32::MIN;
 const ADDRESS_INDEX: u32 = u32::MIN;
 const UNKNOWN_TIMESTAMP: u32 = u32::MIN;
 const NO_POOL_VALUE: u64 = u64::MIN;
+const ZERO_VALUE_LINE: &str = "    value: 0\n";
+const UNKNOWN_VALUE_LINE: &str = "    value: not available\n";
+const ONE_REPLACEMENT: usize = 1;
 const NO_SCANNED_LEGACY_OUTPUTS: u32 = u32::MIN;
 const COMPLETE_PERCENTAGE: u32 = 100;
 const FIRST_CHAIN_HEIGHT: u32 = 1;
-const CONFIRM_PAGE_SIZE: usize = 1;
 const COMMAND_NAME_COUNT: usize = 1;
 const JSON_INDENT: u16 = 2;
+const WALLET_KIND_JSON_INDENT: u16 = 4;
+const CREDENTIAL_SERVICE: &str = "org.wcash.wallet.cli";
+const CREDENTIAL_SCHEMA: &[u8] = b"wcash-cli-mnemonic-v1";
+#[cfg(target_os = "macos")]
+const CREDENTIAL_STORE_DESCRIPTION: &str = "macOS Keychain Services";
+#[cfg(target_os = "windows")]
+const CREDENTIAL_STORE_DESCRIPTION: &str = "Windows Credential Manager";
+#[cfg(target_os = "linux")]
+const CREDENTIAL_STORE_DESCRIPTION: &str =
+    "Linux Secret Service over the logged-in desktop D-Bus session";
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+const CREDENTIAL_STORE_DESCRIPTION: &str = "platform credential service";
+const WALLET_ACCOUNT_COUNT: u32 = 1;
+const SUPPORTED_COMMAND_NAMES: &[&str] = &[
+    "addresses",
+    "balance",
+    "birthday",
+    "calculate",
+    "confirm",
+    "height",
+    "help",
+    "quit",
+    "recovery_info",
+    "save",
+    "send",
+    "shield",
+    "sync",
+    "t_addresses",
+    "transactions",
+    "version",
+    "wallet_kind",
+];
 
-/// Applies Wcash product and asset names to the upstream clap help tree.
-pub(super) fn brand_clap_command(mut command: clap::Command) -> clap::Command {
+/// Builds the Wcash command tree from the supported upstream definitions.
+pub(super) fn augment_commands(mut session: clap::Command) -> clap::Command {
+    use clap::Subcommand as _;
+
+    session = session
+        .mut_arg("chain", |arg| {
+            arg.help(
+                "Wcash network. Use testnet or regtest. The default is testnet. Mainnet is disabled until its consensus identity is frozen.",
+            )
+        })
+        .mut_arg("seed", |arg| {
+            arg.help(
+                "Restore signing access from a 24-word phrase. The phrase is saved in the platform credential store after wallet authority is verified. A phrase passed here is visible in this host's process list and shell history. Export WCASH_SEED instead to keep it to this process and its child.",
+            )
+        })
+        .mut_arg("birthday", |arg| {
+            arg.help("Earliest Wcash block height to scan when restoring a wallet")
+        })
+        .mut_arg("nosync", |arg| {
+            arg.help("Skip automatic synchronization for an online Wcash session")
+        })
+        .mut_arg("waitsync", |arg| arg.hide(true))
+        .mut_arg("offline", |arg| {
+            arg.help("Keep this session offline. Local reads and transaction proposals remain available.")
+        })
+        .mut_arg("online", |arg| {
+            arg.help("Connect this session to the fixed endpoint for the selected Wcash network.")
+        })
+        .mut_arg("server", |arg| arg.hide(true))
+        .mut_arg("viewkey", |arg| arg.hide(true))
+        .mut_arg("nym-proxy", |arg| arg.hide(true));
+    let source = CliCommand::augment_subcommands(clap::Command::new("wcash-commands"));
+    let commands = source
+        .get_subcommands()
+        .filter(|command| SUPPORTED_COMMAND_NAMES.contains(&command.get_name()))
+        .cloned()
+        .map(sanitize_command)
+        .collect::<Vec<_>>();
+    session.subcommands(commands)
+}
+
+fn sanitize_command(mut command: clap::Command) -> clap::Command {
+    command = match command.get_name() {
+        "send" => command
+            .about("Propose a Wcash transfer and print its fee")
+            .long_about(
+                "Propose a Wcash transfer and print its fee. Run `calculate` to sign the current proposal, then `confirm` to broadcast those exact bytes.",
+            ),
+        "calculate" => command
+            .about("Sign the current Wcash proposal offline")
+            .long_about(
+                "Sign the current Wcash proposal from local wallet state. The confirm command handles network access and broadcast.",
+            ),
+        "confirm" => command
+            .about("Broadcast the current calculated Wcash transaction")
+            .long_about(
+                "Revalidate the current calculated Wcash transaction against its canonical chain anchors, then broadcast its exact bytes.",
+            ),
+        "shield" => command
+            .about("Propose shielding mature transparent coinbase funds")
+            .long_about(
+                "Propose moving mature transparent coinbase funds into Ironwood. Run `calculate`, then `confirm`.",
+            ),
+        "save" => {
+            let subs = command
+                .get_subcommands()
+                .cloned()
+                .map(|subcommand| match subcommand.get_name() {
+                    "run" => subcommand.about("Confirm that SQLite persistence is active"),
+                    "check" => subcommand.about("Check SQLite persistence state"),
+                    "shutdown" => subcommand.about("Report that no save task is running"),
+                    _ => subcommand,
+                })
+                .collect::<Vec<_>>();
+            clap::Command::new("save")
+                .about("Inspect the SQLite persistence state")
+                .long_about("Wcash wallet state is committed to SQLite during each operation.")
+                .subcommands(subs)
+        }
+        "wallet_kind" => command.long_about(
+            "Print whether the platform credential store contains spending authority for this Wcash wallet.",
+        ),
+        "height" => command
+            .about("Print the Wcash chain height stored by the wallet")
+            .long_about("Print the exact Wcash chain tip stored by the latest completed sync."),
+        "birthday" => command
+            .about("Print the earliest Wcash block height selected for this wallet")
+            .long_about("Print the wallet birthday used as the lower bound for chain scanning."),
+        "transactions" => command
+            .about("List confirmed and active pending Wcash transactions")
+            .long_about(
+                "List confirmed history and active locally signed transactions at the attested wallet tip.",
+            ),
+        "quit" => command
+            .about("Quit Wcash Wallet")
+            .long_about("Quit the current Wcash Wallet session."),
+        "sync" => {
+            let run = command
+                .get_subcommands()
+                .find(|subcommand| subcommand.get_name() == "run")
+                .cloned()
+                .map(|run| run.about("Run Wcash synchronization to completion"));
+            let sync = clap::Command::new("sync")
+                .about("Sync the wallet to the Wcash chain tip")
+                .long_about("Run the Wcash synchronization task to completion.");
+            if let Some(run) = run {
+                sync.subcommand(run)
+            } else {
+                sync
+            }
+        }
+        _ => command,
+    };
+    brand_clap_command(command)
+}
+
+fn brand_clap_command(mut command: clap::Command) -> clap::Command {
     if let Some(about) = command.get_about().map(ToString::to_string) {
         command = command.about(brand_help(about));
     }
@@ -69,6 +223,18 @@ pub(super) fn brand_help(help: String) -> String {
         .replace("Zingo CLI", "Wcash Wallet")
         .replace("Zcash", "Wcash")
         .replace("ZEC", "Wcash")
+}
+
+/// Renders help from the supported Wcash command tree.
+pub(super) fn format_help(command: Option<&str>) -> String {
+    let mut model = crate::build_clap_app();
+    let Some(name) = command else {
+        return model.render_long_help().to_string();
+    };
+    match model.find_subcommand_mut(name) {
+        Some(subcommand) => subcommand.render_long_help().to_string(),
+        None => format!("Command {name} not found"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,12 +273,9 @@ impl WcashChain {
         if cli_config.communications != Communications::Online {
             return Ok(None);
         }
-        match (&cli_config.server, self) {
-            (Some(server), _) => Ok(Some(server.to_string())),
-            (None, Self::Testnet) => Ok(Some(WcashTestnet.default_endpoint().to_string())),
-            (None, Self::Regtest) => {
-                Err("Wcash Regtest requires an explicit --server endpoint".to_string())
-            }
+        match self {
+            Self::Testnet => Ok(Some(WcashTestnet.default_endpoint().to_string())),
+            Self::Regtest => Ok(Some(WcashRegtest.default_endpoint().to_string())),
         }
     }
 
@@ -135,15 +298,36 @@ impl WcashChain {
     fn confirmed_transactions(
         self,
         wallet_path: &Path,
-    ) -> Result<ConfirmedTransactionHistory, String> {
+    ) -> Result<ConfirmedTransactionSummaryHistory, String> {
         match self {
-            Self::Testnet => WcashTestnetRuntime::read_confirmed_transactions(
+            Self::Testnet => WcashTestnetRuntime::read_confirmed_transaction_summaries(
                 wallet_path,
                 MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE,
             ),
-            Self::Regtest => WcashRegtestRuntime::read_confirmed_transactions(
+            Self::Regtest => WcashRegtestRuntime::read_confirmed_transaction_summaries(
                 wallet_path,
                 MAX_CONFIRMED_TRANSACTION_HISTORY_SIZE,
+            ),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn active_pending_transactions(
+        self,
+        wallet_path: &Path,
+    ) -> Result<PendingSignedTransactionPage, String> {
+        match self {
+            Self::Testnet => WcashTestnetRuntime::read_active_pending_transactions(
+                wallet_path,
+                None,
+                None,
+                MAX_PENDING_TRANSACTION_PAGE_SIZE,
+            ),
+            Self::Regtest => WcashRegtestRuntime::read_active_pending_transactions(
+                wallet_path,
+                None,
+                None,
+                MAX_PENDING_TRANSACTION_PAGE_SIZE,
             ),
         }
         .map_err(|error| error.to_string())
@@ -153,6 +337,55 @@ impl WcashChain {
         match self {
             Self::Testnet => WcashTestnet.validate_recipient(address),
             Self::Regtest => WcashRegtest.validate_recipient(address),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn verify_seed(self, wallet_path: &Path, master_seed: &SecretVec<u8>) -> Result<(), String> {
+        match self {
+            Self::Testnet => WcashTestnet.verify_seed(wallet_path, master_seed),
+            Self::Regtest => WcashRegtest.verify_seed(wallet_path, master_seed),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn propose_send(
+        self,
+        wallet_path: &Path,
+        payments: Vec<WcashTestnetPayment>,
+    ) -> Result<StagedTransactionProposal, String> {
+        match self {
+            Self::Testnet => WcashTestnetRuntime::propose_send(wallet_path, payments),
+            Self::Regtest => WcashRegtestRuntime::propose_send(wallet_path, payments),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn propose_shield(self, wallet_path: &Path) -> Result<StagedTransactionProposal, String> {
+        match self {
+            Self::Testnet => WcashTestnetRuntime::propose_shield_coinbase(wallet_path),
+            Self::Regtest => WcashRegtestRuntime::propose_shield_coinbase(wallet_path),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn calculate(
+        self,
+        wallet_path: &Path,
+        master_seed: &SecretVec<u8>,
+        staged: &StagedTransactionProposal,
+    ) -> Result<CalculatedTransaction, String> {
+        match self {
+            Self::Testnet => WcashTestnetRuntime::calculate(wallet_path, master_seed, staged),
+            Self::Regtest => WcashRegtestRuntime::calculate(wallet_path, master_seed, staged),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn cancel(self, wallet_path: &Path, staged: &StagedTransactionProposal) -> Result<(), String> {
+        match self {
+            Self::Testnet => WcashTestnetRuntime::cancel(wallet_path, staged),
+            Self::Regtest => WcashRegtestRuntime::cancel(wallet_path, staged),
         }
         .map_err(|error| error.to_string())
     }
@@ -174,58 +407,90 @@ impl OnlineRuntime {
         .map_err(|error| error.to_string())
     }
 
-    async fn send(
+    async fn broadcast_calculated(
         &mut self,
-        master_seed: &SecretVec<u8>,
-        payments: Vec<WcashTestnetPayment>,
-    ) -> Result<SignedTransaction, String> {
-        match self {
-            Self::Testnet(runtime) => runtime.send(master_seed, payments).await,
-            Self::Regtest(runtime) => runtime.send(master_seed, payments).await,
-        }
-        .map_err(|error| error.to_string())
-    }
-
-    async fn shield_coinbase(
-        &mut self,
-        master_seed: &SecretVec<u8>,
-    ) -> Result<SignedTransaction, String> {
-        match self {
-            Self::Testnet(runtime) => runtime.shield_coinbase(master_seed).await,
-            Self::Regtest(runtime) => runtime.shield_coinbase(master_seed).await,
-        }
-        .map_err(|error| error.to_string())
-    }
-
-    fn active_pending_transactions(&self) -> Result<PendingSignedTransactionPage, String> {
-        match self {
-            Self::Testnet(runtime) => {
-                runtime.active_pending_transactions(None, None, CONFIRM_PAGE_SIZE)
-            }
-            Self::Regtest(runtime) => {
-                runtime.active_pending_transactions(None, None, CONFIRM_PAGE_SIZE)
-            }
-        }
-        .map_err(|error| error.to_string())
-    }
-
-    async fn broadcast_pending(
-        &mut self,
-        signed: &StoredSignedTransaction,
+        calculated: &CalculatedTransaction,
     ) -> Result<BroadcastResult, String> {
         match self {
-            Self::Testnet(runtime) => runtime.broadcast_pending(signed).await,
-            Self::Regtest(runtime) => runtime.broadcast_pending(signed).await,
+            Self::Testnet(runtime) => runtime.broadcast_calculated(calculated).await,
+            Self::Regtest(runtime) => runtime.broadcast_calculated(calculated).await,
         }
         .map_err(|error| error.to_string())
     }
+}
+
+struct CredentialStore {
+    account: String,
+    #[cfg(test)]
+    test_phrase: Option<SecretString>,
+}
+
+impl CredentialStore {
+    fn for_wallet(chain: WcashChain, wallet_path: &Path) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(CREDENTIAL_SCHEMA);
+        hash.update(chain.storage_namespace().as_bytes());
+        hash.update(wallet_path.as_os_str().as_encoded_bytes());
+        Self {
+            account: hex::encode(hash.finalize()),
+            #[cfg(test)]
+            test_phrase: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(phrase: &str) -> Self {
+        Self {
+            account: "test-wallet".to_string(),
+            test_phrase: Some(SecretString::new(phrase.to_string())),
+        }
+    }
+
+    fn store(&mut self, phrase: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if self.test_phrase.is_some() {
+            self.test_phrase = Some(SecretString::new(phrase.to_string()));
+            return Ok(());
+        }
+        self.entry()?.set_password(phrase).map_err(credential_error)
+    }
+
+    fn load(&self) -> Result<Option<SecretString>, String> {
+        #[cfg(test)]
+        if let Some(phrase) = &self.test_phrase {
+            return Ok(Some(phrase.clone()));
+        }
+        match self.entry()?.get_password() {
+            Ok(phrase) => Ok(Some(SecretString::new(phrase))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(credential_error(error)),
+        }
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        match self.entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(credential_error(error)),
+        }
+    }
+
+    fn entry(&self) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(CREDENTIAL_SERVICE, &self.account).map_err(credential_error)
+    }
+}
+
+fn credential_error(error: keyring::Error) -> String {
+    format!("{CREDENTIAL_STORE_DESCRIPTION} rejected the Wcash recovery phrase: {error}")
 }
 
 struct WcashCliSession {
     chain: WcashChain,
     wallet_path: PathBuf,
     runtime: Option<OnlineRuntime>,
-    master_seed: Option<SecretVec<u8>>,
+    credentials: CredentialStore,
+    proposal: Option<StagedTransactionProposal>,
+    calculated: Option<CalculatedTransaction>,
+    transmitted_txids: HashSet<String>,
     info: WalletInfo,
     last_sync: Option<String>,
 }
@@ -268,11 +533,16 @@ pub(super) fn communications(matches: &clap::ArgMatches) -> io::Result<Communica
     let data_dir = super::data_dir_from(matches);
     if matches.get_flag("forget-online") {
         zingolib::connectivity::forget_connectivity_consent(&data_dir)?;
-        eprintln!("Standing Connectivity Consent forgotten; future sessions start offline again.");
+        eprintln!("Standing Connectivity Consent forgotten. Future sessions start offline again.");
     }
 
     let explicit_server =
         matches.value_source("server") == Some(clap::parser::ValueSource::CommandLine);
+    if explicit_server {
+        return Err(io::Error::other(
+            "Wcash network endpoints are fixed by the selected chain profile",
+        ));
+    }
     if matches.get_flag("offline") {
         eprintln!("{}", super::DELIBERATE_OFFLINE_NOTICE);
         return Ok(Communications::DeliberateOffline);
@@ -286,18 +556,18 @@ pub(super) fn communications(matches: &clap::ArgMatches) -> io::Result<Communica
     if remember_online {
         zingolib::connectivity::store_standing_online(&data_dir)?;
         eprintln!(
-            "Standing Connectivity Consent stored in '{}'; future sessions attach to the network automatically. Undo with --forget-online.",
+            "Standing Connectivity Consent stored in '{}'. Future sessions attach to the network automatically. Undo with --forget-online.",
             data_dir
                 .join(zingolib::connectivity::CONNECTIVITY_CONSENT_FILE)
                 .display()
         );
     }
 
-    if matches.get_flag("online") || remember_online || explicit_server || stored_online {
+    if matches.get_flag("online") || remember_online || stored_online {
         Ok(Communications::Online)
     } else {
         eprintln!(
-            "No Connectivity Consent is recorded, so this Wcash Wallet session runs offline. Pass --online, --remember-online, or --server <uri> to connect."
+            "No Connectivity Consent is recorded, so this Wcash Wallet session runs offline. Pass --online or --remember-online to connect."
         );
         Ok(Communications::UnconsentedOffline)
     }
@@ -308,17 +578,11 @@ pub(super) fn posture_preview(matches: &clap::ArgMatches) -> Communications {
     if matches.get_flag("offline") {
         return Communications::DeliberateOffline;
     }
-    let explicit_server =
-        matches.value_source("server") == Some(clap::parser::ValueSource::CommandLine);
     let stored_online = matches!(
         zingolib::connectivity::load_connectivity_consent(&super::data_dir_from(matches)),
         zingolib::connectivity::ConnectivityConsent::StandingOnline
     );
-    if matches.get_flag("online")
-        || matches.get_flag("remember-online")
-        || explicit_server
-        || stored_online
-    {
+    if matches.get_flag("online") || matches.get_flag("remember-online") || stored_online {
         Communications::Online
     } else {
         Communications::UnconsentedOffline
@@ -342,23 +606,30 @@ fn startup(cli_config: &CliConfigTemplate) -> Result<WcashCliSession, String> {
     std::fs::create_dir_all(&cli_config.data_dir).map_err(|error| error.to_string())?;
     let wallet_path = chain.wallet_path(&cli_config.data_dir);
     let endpoint = chain.endpoint(cli_config)?;
+    let mut credentials = CredentialStore::for_wallet(chain, &wallet_path);
 
     if cli_config.ufvk.is_some() {
         return Err("Wcash viewing-key restore is not available in this release".to_string());
     }
+    if cli_config.server.is_some() {
+        return Err("Wcash network endpoints are fixed by the selected chain profile".to_string());
+    }
+    if cli_config.nym_proxy_path.is_some() {
+        return Err("Wcash does not accept a Zingo nym-proxy override".to_string());
+    }
 
-    let (runtime, info, generated_phrase, master_seed) = if wallet_path.exists() {
-        let master_seed = cli_config
-            .seed
-            .as_deref()
-            .map(master_seed_from_phrase)
-            .transpose()?;
+    let (runtime, info) = if wallet_path.exists() {
         let info = chain.inspect(&wallet_path)?;
+        if let Some(phrase) = cli_config.seed.as_deref() {
+            let master_seed = master_seed_from_phrase(phrase)?;
+            chain.verify_seed(&wallet_path, &master_seed)?;
+            credentials.store(phrase)?;
+        }
         let runtime = endpoint
             .as_deref()
             .map(|endpoint| RT.block_on(open_runtime(chain, endpoint, &wallet_path)))
             .transpose()?;
-        (runtime, info, None, master_seed)
+        (runtime, info)
     } else {
         let endpoint = endpoint
             .as_deref()
@@ -368,34 +639,39 @@ fn startup(cli_config: &CliConfigTemplate) -> Result<WcashCliSession, String> {
             || Ok(Mnemonic::<English>::generate(Count::Words24)),
             |phrase| Mnemonic::<English>::from_phrase(phrase).map_err(|error| error.to_string()),
         )?;
-        let generated_phrase = supplied.is_none().then(|| mnemonic.phrase().to_string());
+        let phrase = mnemonic.phrase();
         let master_seed = SecretVec::new(mnemonic.to_seed("").as_slice().to_vec());
         let birthday = u32::try_from(cli_config.birthday)
             .map_err(|_| "the Wcash wallet birthday exceeds u32".to_string())?;
-        let (runtime, initialized) = RT.block_on(initialize_runtime(
+        credentials.store(phrase)?;
+        let initialized = RT.block_on(initialize_runtime(
             chain,
             endpoint,
             &wallet_path,
             &master_seed,
             supplied.is_some().then_some(birthday),
-        ))?;
-        (
-            Some(runtime),
-            wallet_info(initialized),
-            generated_phrase,
-            Some(master_seed),
-        )
+        ));
+        let (runtime, initialized) = match initialized {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                let _ = credentials.remove();
+                return Err(error);
+            }
+        };
+        if supplied.is_none() {
+            println!("Wcash Wallet recovery phrase:\n{phrase}");
+        }
+        (Some(runtime), wallet_info(initialized))
     };
-
-    if let Some(phrase) = generated_phrase {
-        eprintln!("Wcash Wallet recovery phrase:\n{phrase}");
-    }
 
     let mut session = WcashCliSession {
         chain,
         wallet_path,
         runtime,
-        master_seed,
+        credentials,
+        proposal: None,
+        calculated: None,
+        transmitted_txids: HashSet::new(),
         info,
         last_sync: None,
     };
@@ -478,15 +754,48 @@ fn wallet_info(initialized: InitializedWallet) -> WalletInfo {
 
 /// Parses one REPL line with the upstream clap grammar and Wcash recipient validation seam.
 pub(super) fn parse_command_tokens(tokens: &[String]) -> Result<CliCommand, String> {
-    if tokens.first().is_some_and(|name| name == "send") {
+    let command = if tokens.first().is_some_and(|name| name == "send") {
         let command = CliCommand::Send {
             args: tokens[COMMAND_NAME_COUNT..].to_vec(),
         };
         validate_deferred_grammar(&command)?;
+        command
+    } else {
+        crate::commands::parse_command_tokens(tokens)?
+    };
+    if supported_command(&command) {
         Ok(command)
     } else {
-        crate::commands::parse_command_tokens(tokens)
+        Err(format!(
+            "Command {} is not available in Wcash Wallet",
+            command.name()
+        ))
     }
+}
+
+fn supported_command(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Addresses
+            | CliCommand::Balance
+            | CliCommand::Birthday
+            | CliCommand::Calculate
+            | CliCommand::Confirm
+            | CliCommand::Height
+            | CliCommand::Help { .. }
+            | CliCommand::Quit
+            | CliCommand::RecoveryInfo
+            | CliCommand::Save { .. }
+            | CliCommand::Send { .. }
+            | CliCommand::Shield
+            | CliCommand::Sync {
+                sub: SyncSubCommand::Run
+            }
+            | CliCommand::TAddresses
+            | CliCommand::Transactions
+            | CliCommand::Version
+            | CliCommand::WalletKind
+    )
 }
 
 /// Runs the Wcash-aware deferred grammar checks for one parsed command.
@@ -531,10 +840,7 @@ fn command_loop(mut session: WcashCliSession, communications: Communications) ->
 
             if let CliCommand::Help { command } = &command {
                 if response_transmitter
-                    .send(Ok(brand_help(crate::commands::format_help(
-                        communications,
-                        command.as_deref(),
-                    ))))
+                    .send(Ok(format_help(command.as_deref())))
                     .is_err()
                 {
                     break;
@@ -574,6 +880,8 @@ fn dispatch(command: CliCommand, session: &mut WcashCliSession) -> Result<String
         .pretty(JSON_INDENT)),
         CliCommand::Calculate => calculate(session),
         CliCommand::Confirm => confirm(session),
+        CliCommand::RecoveryInfo => recovery_info(session),
+        CliCommand::Save { sub } => save(sub),
         CliCommand::Send { args } => send(&args, session),
         CliCommand::Shield => shield(session),
         CliCommand::Sync {
@@ -583,19 +891,21 @@ fn dispatch(command: CliCommand, session: &mut WcashCliSession) -> Result<String
             Ok("Launching sync task...".to_string())
         }
         CliCommand::TAddresses => render_transparent_addresses(&session.info),
-        CliCommand::Transactions => {
-            render_transactions(session.chain.confirmed_transactions(&session.wallet_path)?)
-        }
-        CliCommand::Help { command } => Ok(brand_help(crate::commands::format_help(
-            if session.runtime.is_some() {
-                Communications::Online
-            } else {
-                Communications::UnconsentedOffline
-            },
-            command.as_deref(),
-        ))),
+        CliCommand::Transactions => render_transactions(
+            session.chain.confirmed_transactions(&session.wallet_path)?,
+            session
+                .chain
+                .active_pending_transactions(&session.wallet_path)?,
+            session
+                .calculated
+                .as_ref()
+                .map(|calculated| calculated.signed().txid.as_str()),
+            &session.transmitted_txids,
+        ),
+        CliCommand::Help { command } => Ok(format_help(command.as_deref())),
         CliCommand::Version => Ok(zingolib::git_description().to_string()),
         CliCommand::Quit => Ok("Wcash Wallet quit successfully.".to_string()),
+        CliCommand::WalletKind => wallet_kind(session),
         unsupported => Err(format!(
             "the `{}` command is outside the first Wcash CLI compatibility slice",
             unsupported.name()
@@ -604,85 +914,136 @@ fn dispatch(command: CliCommand, session: &mut WcashCliSession) -> Result<String
 }
 
 fn send(args: &[String], session: &mut WcashCliSession) -> Result<String, String> {
+    require_no_calculated_transaction(session.calculated.is_some())?;
     let payments = parse_send_args(args)?;
     for payment in &payments {
         session.chain.validate_recipient(&payment.address)?;
     }
-    let master_seed = session.master_seed.as_ref().ok_or_else(|| {
-        "send requires the recovery phrase through --seed or WCASH_SEED for this session"
-            .to_string()
-    })?;
-    let runtime = session
-        .runtime
-        .as_mut()
-        .ok_or_else(|| "send requires an online Wcash session".to_string())?;
-    let signed = RT.block_on(runtime.send(master_seed, payments))?;
-    Ok(json::object! { "fee" => signed.fee_zat }.pretty(JSON_INDENT))
+    cancel_proposal(session)?;
+    let proposal = session.chain.propose_send(&session.wallet_path, payments)?;
+    let fee = proposal.fee_zat();
+    session.proposal = Some(proposal);
+    Ok(json::object! { "fee" => fee }.pretty(JSON_INDENT))
 }
 
 fn shield(session: &mut WcashCliSession) -> Result<String, String> {
-    let value_before_fee = session
-        .balance()?
-        .accounts
-        .first()
-        .ok_or_else(|| "the Wcash wallet has no account balance".to_string())?
-        .transparent_coinbase_spendable_zat;
-    let master_seed = session.master_seed.as_ref().ok_or_else(|| {
-        "shield requires the recovery phrase through --seed or WCASH_SEED for this session"
-            .to_string()
-    })?;
-    let runtime = session
-        .runtime
-        .as_mut()
-        .ok_or_else(|| "shield requires an online Wcash session".to_string())?;
-    let signed = RT.block_on(runtime.shield_coinbase(master_seed))?;
-    let value_to_shield = value_before_fee
-        .checked_sub(signed.fee_zat)
-        .ok_or_else(|| "the Wcash shielding fee exceeds the selected value".to_string())?;
+    require_no_calculated_transaction(session.calculated.is_some())?;
+    cancel_proposal(session)?;
+    let proposal = session.chain.propose_shield(&session.wallet_path)?;
+    let fee = proposal.fee_zat();
+    let value_to_shield = proposal
+        .value_to_shield_zat()
+        .ok_or_else(|| "the Wcash shielding proposal has no selected value".to_string())?;
+    session.proposal = Some(proposal);
     Ok(json::object! {
         "value_to_shield" => value_to_shield,
-        "fee" => signed.fee_zat,
+        "fee" => fee,
     }
     .pretty(JSON_INDENT))
 }
 
+fn require_no_calculated_transaction(calculated: bool) -> Result<(), String> {
+    if calculated {
+        Err(
+            "the calculated transaction must be confirmed before another proposal is created"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn cancel_proposal(session: &mut WcashCliSession) -> Result<(), String> {
+    if let Some(proposal) = session.proposal.as_ref() {
+        session
+            .chain
+            .cancel(&session.wallet_path, proposal)
+            .map_err(|error| format!("the prior proposal could not be cancelled: {error}"))?;
+    }
+    session.proposal = None;
+    Ok(())
+}
+
 fn confirm(session: &mut WcashCliSession) -> Result<String, String> {
+    let calculated = session
+        .calculated
+        .as_ref()
+        .ok_or_else(|| "no calculated proposal is ready to confirm".to_string())?;
     let runtime = session
         .runtime
         .as_mut()
         .ok_or_else(|| "confirm requires an online Wcash session".to_string())?;
-    let page = runtime.active_pending_transactions()?;
-    let signed = page
-        .transactions
-        .first()
-        .ok_or_else(|| "no stored proposal is ready to confirm".to_string())?;
-    let result = RT.block_on(runtime.broadcast_pending(signed))?;
-    Ok(json::object! {
-        "txids" => json::JsonValue::Array(vec![json::JsonValue::from(result.txid)]),
+    let result = RT.block_on(runtime.broadcast_calculated(calculated))?;
+    let rendered = json::object! {
+        "txids" => json::JsonValue::Array(vec![json::JsonValue::from(result.txid.as_str())]),
     }
-    .pretty(JSON_INDENT))
+    .pretty(JSON_INDENT);
+    session.calculated = None;
+    session.transmitted_txids.insert(result.txid);
+    Ok(rendered)
 }
 
-fn calculate(session: &WcashCliSession) -> Result<String, String> {
-    let runtime = session
-        .runtime
+fn calculate(session: &mut WcashCliSession) -> Result<String, String> {
+    let phrase = session.credentials.load()?.ok_or_else(|| {
+        "the recovery phrase is missing from the platform credential store. Open once with --seed and --birthday to restore signing access"
+            .to_string()
+    })?;
+    let master_seed = master_seed_from_phrase(phrase.expose_secret())?;
+    let proposal = session
+        .proposal
         .as_ref()
-        .ok_or_else(|| "calculate requires an online Wcash session".to_string())?;
-    let page = runtime.active_pending_transactions()?;
-    let txids = page
-        .transactions
-        .iter()
-        .map(|transaction| transaction.txid.as_str())
-        .collect::<Vec<_>>();
-    if txids.is_empty() {
-        return Err("no stored proposal is ready to calculate".to_string());
+        .ok_or_else(|| "no stored proposal is ready to calculate".to_string())?;
+    let calculated = session
+        .chain
+        .calculate(&session.wallet_path, &master_seed, proposal)?;
+    let txid = calculated.signed().txid.as_str();
+    let rendered = json::object! {
+        "txids" => json::JsonValue::Array(vec![json::JsonValue::from(txid)]),
     }
-    Ok(json::object! {
-        "txids" => json::JsonValue::Array(
-            txids.into_iter().map(json::JsonValue::from).collect()
-        ),
+    .pretty(JSON_INDENT);
+    session.proposal = None;
+    session.calculated = Some(calculated);
+    Ok(rendered)
+}
+
+fn recovery_info(session: &WcashCliSession) -> Result<String, String> {
+    let phrase = session.credentials.load()?.ok_or_else(|| {
+        "no mnemonic found in the platform credential store for this wallet".to_string()
+    })?;
+    Ok(zingolib::wallet::RecoveryInfo {
+        seed_phrase: phrase.expose_secret().to_string(),
+        birthday: u64::from(session.info.birthday_height),
+        no_of_accounts: WALLET_ACCOUNT_COUNT,
     }
-    .pretty(JSON_INDENT))
+    .to_string())
+}
+
+fn save(sub: SaveSubCommand) -> Result<String, String> {
+    Ok(match sub {
+        SaveSubCommand::Run => "Wallet state is already persisted.".to_string(),
+        SaveSubCommand::Check => String::new(),
+        SaveSubCommand::Shutdown => "No save task was running.".to_string(),
+    })
+}
+
+fn wallet_kind(session: &WcashCliSession) -> Result<String, String> {
+    let has_mnemonic = session.credentials.load()?.is_some();
+    Ok(if has_mnemonic {
+        json::object! {
+            "kind" => "Loaded from mnemonic (seed or phrase)",
+            "transparent" => true,
+            "sapling" => false,
+            "orchard" => true,
+        }
+    } else {
+        json::object! {
+            "kind" => "No spending authority found",
+            "transparent" => true,
+            "sapling" => false,
+            "orchard" => true,
+        }
+    }
+    .pretty(WALLET_KIND_JSON_INDENT))
 }
 
 fn parse_send_args(args: &[String]) -> Result<Vec<WcashTestnetPayment>, String> {
@@ -823,11 +1184,18 @@ fn zatoshis(amount: u64) -> Result<Zatoshis, String> {
     Zatoshis::from_u64(amount).map_err(|_| "the Wcash balance exceeds the money range".to_string())
 }
 
-fn render_transactions(history: ConfirmedTransactionHistory) -> Result<String, String> {
-    let summaries = history
+fn render_transactions(
+    history: ConfirmedTransactionSummaryHistory,
+    pending: PendingSignedTransactionPage,
+    calculated_txid: Option<&str>,
+    transmitted_txids: &HashSet<String>,
+) -> Result<String, String> {
+    let confirmed = history
         .transactions
         .into_iter()
-        .map(|transaction| {
+        .map(|summary| {
+            let value_zat = summary.value_zat;
+            let transaction = summary.transaction;
             let kind = match (transaction.direction, transaction.kind) {
                 (ConfirmedTransactionDirection::Incoming, _) => TransactionKind::Received,
                 (_, ConfirmedTransactionKind::Shielding) => TransactionKind::Sent(SendType::Shield),
@@ -843,7 +1211,7 @@ fn render_transactions(history: ConfirmedTransactionHistory) -> Result<String, S
                 (_, ConfirmedTransactionKind::Shielding) => vec![PoolType::TRANSPARENT],
                 _ => vec![PoolType::IRONWOOD],
             };
-            Ok(TransactionSummary {
+            let rendered = TransactionSummaries::new(vec![TransactionSummary {
                 txid: txid_from_hex_encoded_str(&transaction.txid)
                     .map_err(|error| error.to_string())?,
                 datetime: transaction.timestamp.unwrap_or(UNKNOWN_TIMESTAMP),
@@ -852,7 +1220,7 @@ fn render_transactions(history: ConfirmedTransactionHistory) -> Result<String, S
                 )),
                 blockheight: BlockHeight::from_u32(transaction.mined_height),
                 kind,
-                value: transaction.amount_delta_zat.unsigned_abs(),
+                value: value_zat.unwrap_or(NO_POOL_VALUE),
                 fee: transaction.fee_zat,
                 zec_price: None,
                 pools_sent_from,
@@ -864,10 +1232,61 @@ fn render_transactions(history: ConfirmedTransactionHistory) -> Result<String, S
                 outgoing_orchard_notes: Vec::new(),
                 outgoing_sapling_notes: Vec::new(),
                 outgoing_transparent_coins: Vec::new(),
+            }])
+            .to_string();
+            Ok(if value_zat.is_some() {
+                rendered
+            } else {
+                rendered.replacen(ZERO_VALUE_LINE, UNKNOWN_VALUE_LINE, ONE_REPLACEMENT)
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(TransactionSummaries::new(summaries).to_string())
+        .collect::<Result<String, String>>()?;
+    let pending = render_pending_transactions(pending, calculated_txid, transmitted_txids)?;
+    Ok(format!("{pending}{confirmed}"))
+}
+
+fn render_pending_transactions(
+    pending: PendingSignedTransactionPage,
+    calculated_txid: Option<&str>,
+    transmitted_txids: &HashSet<String>,
+) -> Result<String, String> {
+    if pending.exact_tip.is_none() {
+        return Err("active pending transactions have no attested wallet tip".to_string());
+    }
+    let mut rendered = String::new();
+    for transaction in pending.transactions.into_iter().rev() {
+        txid_from_hex_encoded_str(&transaction.txid).map_err(|error| error.to_string())?;
+        let status = if transmitted_txids.contains(&transaction.txid) {
+            "transmitted"
+        } else if calculated_txid == Some(transaction.txid.as_str()) {
+            "calculated"
+        } else {
+            "calculated or transmitted"
+        };
+        rendered.push_str(&format!(
+            "\n{{
+    txid: {}
+    datetime: not available
+    status: {status}
+    blockheight: not available
+    kind: not available
+    value: not available
+    fee: not available
+    zec price: not available
+    pools sent from: not available
+    ironwood notes: []
+    orchard notes: []
+    sapling notes: []
+    transparent coins: []
+    outgoing ironwood notes: []
+    outgoing orchard notes: []
+    outgoing sapling notes: []
+    outgoing transparent coins: []
+}}",
+            transaction.txid
+        ));
+    }
+    Ok(rendered)
 }
 
 fn render_sync(start_height: u32, summary: &WalletBalanceSummary) -> String {
@@ -893,13 +1312,17 @@ mod tests {
     const MAX_MEMO_BYTES: usize = 512;
     const TEST_IRONWOOD_ADDRESS: &str = "waswo";
     const TEST_TRANSPARENT_ADDRESS: &str = "WTtest";
+    const TEST_PHRASE: &str = "test recovery phrase";
 
     fn session(directory: &Path) -> WcashCliSession {
         WcashCliSession {
             chain: WcashChain::Testnet,
             wallet_path: WcashChain::Testnet.wallet_path(directory),
             runtime: None,
-            master_seed: None,
+            credentials: CredentialStore::for_test(TEST_PHRASE),
+            proposal: None,
+            calculated: None,
+            transmitted_txids: HashSet::new(),
             info: WalletInfo {
                 account_id: TEST_ACCOUNT_ID.to_string(),
                 birthday_height: TEST_BIRTHDAY,
@@ -926,6 +1349,29 @@ mod tests {
             WcashChain::Testnet.wallet_path(directory.path()),
             WcashChain::Regtest.wallet_path(directory.path())
         );
+    }
+
+    #[test]
+    fn credential_accounts_are_bound_to_the_wallet_path_and_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.sqlite3");
+        let testnet = CredentialStore::for_wallet(WcashChain::Testnet, &wallet_path);
+        let regtest = CredentialStore::for_wallet(WcashChain::Regtest, &wallet_path);
+        let other_path = CredentialStore::for_wallet(
+            WcashChain::Testnet,
+            &directory.path().join("other.sqlite3"),
+        );
+
+        assert_ne!(testnet.account, regtest.account);
+        assert_ne!(testnet.account, other_path.account);
+    }
+
+    #[test]
+    fn credential_store_failure_names_the_required_platform_service() {
+        let error = credential_error(keyring::Error::NoDefaultStore);
+
+        assert!(error.contains(CREDENTIAL_STORE_DESCRIPTION));
+        assert!(error.contains("Wcash recovery phrase"));
     }
 
     #[test]
@@ -977,12 +1423,51 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_command_fails_at_the_wcash_dispatch_seam() {
+    fn recovery_info_uses_the_platform_credential_shape() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = session(directory.path());
-        let error = dispatch(CliCommand::RecoveryInfo, &mut session).unwrap_err();
+        let info = dispatch(CliCommand::RecoveryInfo, &mut session).unwrap();
 
-        assert!(error.contains("recovery_info"));
+        assert!(info.contains(TEST_PHRASE));
+        assert!(info.contains(&TEST_BIRTHDAY.to_string()));
+    }
+
+    #[test]
+    fn unsupported_command_is_rejected_before_dispatch() {
+        let error = parse_command_tokens(&["info".to_string()]).unwrap_err();
+
+        assert!(error.contains("not available"));
+    }
+
+    #[test]
+    fn help_lists_only_routed_commands_and_no_zcash_examples() {
+        let help = format_help(None);
+        let invalid = [
+            "ztestsapling",
+            "tmSwk8",
+            "zennies_for_zingo",
+            "$ZINGO_NYM_PROXY",
+            "viewkey",
+            "Server-Selection Sweep",
+            r#"Defaults to "mainnet""#,
+        ];
+
+        for command in SUPPORTED_COMMAND_NAMES {
+            assert!(help.contains(command));
+            let command_help = format_help(Some(command));
+            for invalid_text in invalid {
+                assert!(
+                    !command_help.contains(invalid_text),
+                    "unexpected {command} help text: {invalid_text}"
+                );
+            }
+        }
+        for invalid_text in invalid {
+            assert!(
+                !help.contains(invalid_text),
+                "unexpected help text: {invalid_text}"
+            );
+        }
     }
 
     #[test]
@@ -1012,5 +1497,124 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_calculated_transaction_blocks_replacement_proposals() {
+        let error = require_no_calculated_transaction(true).unwrap_err();
+
+        assert!(error.contains("must be confirmed"));
+        assert!(require_no_calculated_transaction(false).is_ok());
+    }
+
+    #[test]
+    fn pending_transactions_remain_visible_with_truthful_unknown_fields() {
+        let txid = "11".repeat(32);
+        let pending = PendingSignedTransactionPage {
+            exact_tip: Some(zingolib::wcash::BlockRef {
+                height: 300,
+                hash: [0x22; 32],
+            }),
+            transactions: vec![StoredSignedTransaction {
+                txid: txid.clone(),
+                raw_transaction_hex: String::new(),
+                branch_id: String::new(),
+                expiry_height: 340,
+            }],
+            next_after_row_id: None,
+        };
+        let transmitted = HashSet::from([txid.clone()]);
+        let rendered = render_pending_transactions(pending, None, &transmitted).unwrap();
+
+        assert!(rendered.contains(&format!("txid: {txid}")));
+        assert!(rendered.contains("status: transmitted"));
+        assert!(rendered.contains("blockheight: not available"));
+        assert!(rendered.contains("value: not available"));
+    }
+
+    #[test]
+    fn confirmed_transactions_use_backend_kind_and_display_value() {
+        const TXID_BYTE_COUNT: usize = 32;
+        const MINED_HEIGHT: u32 = 95;
+        const TIP_HEIGHT: u32 = 100;
+        const TIP_HASH_BYTE: u8 = 0x44;
+        const CONFIRMATIONS: u32 = TIP_HEIGHT - MINED_HEIGHT + 1;
+        const SHIELD_DELTA_ZAT: i64 = -20_000;
+        const SHIELD_FEE_ZAT: u64 = 20_000;
+        const SHIELD_VALUE_ZAT: u64 = 1_249_980_000;
+        const SEND_DELTA_ZAT: i64 = -110_000;
+        const SEND_FEE_ZAT: u64 = 10_000;
+        const SEND_VALUE_ZAT: u64 = 100_000;
+
+        let shield_txid = "22".repeat(TXID_BYTE_COUNT);
+        let send_txid = "33".repeat(TXID_BYTE_COUNT);
+        let metadata_poor_txid = "44".repeat(TXID_BYTE_COUNT);
+        let transaction = |txid, kind, delta, fee| zingolib::wcash::ConfirmedTransaction {
+            txid,
+            mined_height: MINED_HEIGHT,
+            direction: if kind == ConfirmedTransactionKind::Shielding {
+                ConfirmedTransactionDirection::Internal
+            } else {
+                ConfirmedTransactionDirection::Outgoing
+            },
+            kind,
+            amount_delta_zat: delta,
+            fee_zat: fee,
+            timestamp: None,
+            confirmations: CONFIRMATIONS,
+        };
+        let history = ConfirmedTransactionSummaryHistory {
+            exact_tip: zingolib::wcash::BlockRef {
+                height: TIP_HEIGHT,
+                hash: [TIP_HASH_BYTE; TXID_BYTE_COUNT],
+            },
+            transactions: vec![
+                zingolib::wcash::ConfirmedTransactionSummary {
+                    transaction: transaction(
+                        shield_txid.clone(),
+                        ConfirmedTransactionKind::Shielding,
+                        SHIELD_DELTA_ZAT,
+                        Some(SHIELD_FEE_ZAT),
+                    ),
+                    value_zat: Some(SHIELD_VALUE_ZAT),
+                },
+                zingolib::wcash::ConfirmedTransactionSummary {
+                    transaction: transaction(
+                        send_txid.clone(),
+                        ConfirmedTransactionKind::Transfer,
+                        SEND_DELTA_ZAT,
+                        Some(SEND_FEE_ZAT),
+                    ),
+                    value_zat: Some(SEND_VALUE_ZAT),
+                },
+                zingolib::wcash::ConfirmedTransactionSummary {
+                    transaction: transaction(
+                        metadata_poor_txid.clone(),
+                        ConfirmedTransactionKind::Transfer,
+                        SEND_DELTA_ZAT,
+                        None,
+                    ),
+                    value_zat: None,
+                },
+            ],
+        };
+        let pending = PendingSignedTransactionPage {
+            exact_tip: Some(history.exact_tip),
+            transactions: Vec::new(),
+            next_after_row_id: None,
+        };
+
+        let rendered = render_transactions(history, pending, None, &HashSet::new()).unwrap();
+
+        assert!(rendered.contains(&format!("txid: {shield_txid}")));
+        assert!(rendered.contains("kind: shield"));
+        assert!(rendered.contains("value: 1249980000"));
+        assert!(rendered.contains(&format!("txid: {send_txid}")));
+        assert!(rendered.contains("kind: sent"));
+        assert!(rendered.contains("value: 100000"));
+        let metadata_poor = rendered
+            .find(&format!("txid: {metadata_poor_txid}"))
+            .unwrap();
+        assert!(rendered[metadata_poor..].contains("value: not available"));
     }
 }
