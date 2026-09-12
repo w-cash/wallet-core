@@ -3994,7 +3994,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4742,7 +4742,7 @@ dependencies = [
 [[package]]
 name = "wcash-genesis"
 version = "0.1.0"
-source = "git+https://github.com/w-cash/wolf.git?rev=9a9c0668784117f116d5b69bdb3a090765092343#9a9c0668784117f116d5b69bdb3a090765092343"
+source = "git+https://github.com/w-cash/wolf.git?rev=b44571035074900570ef13f4fa96787886674ada#b44571035074900570ef13f4fa96787886674ada"
 dependencies = [
  "blake2b_simd",
  "sha2 0.10.9",
@@ -4751,7 +4751,7 @@ dependencies = [
 [[package]]
 name = "wcash-wallet"
 version = "0.1.0"
-source = "git+https://github.com/w-cash/wolf.git?rev=9a9c0668784117f116d5b69bdb3a090765092343#9a9c0668784117f116d5b69bdb3a090765092343"
+source = "git+https://github.com/w-cash/wolf.git?rev=b44571035074900570ef13f4fa96787886674ada#b44571035074900570ef13f4fa96787886674ada"
 dependencies = [
  "async-trait",
  "blake2b_simd",
@@ -5436,7 +5436,7 @@ dependencies = [
 [[package]]
 name = "zebra-chain"
 version = "12.0.0"
-source = "git+https://github.com/w-cash/wolf.git?rev=9a9c0668784117f116d5b69bdb3a090765092343#9a9c0668784117f116d5b69bdb3a090765092343"
+source = "git+https://github.com/w-cash/wolf.git?rev=b44571035074900570ef13f4fa96787886674ada#b44571035074900570ef13f4fa96787886674ada"
 dependencies = [
  "bech32",
  "bitflags 2.13.1",

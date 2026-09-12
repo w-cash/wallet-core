@@ -15,9 +15,12 @@ default = []
 # stands without it.
 perspective = []
 nym = ["zingo-netutils/socks5-transmit", "zingo-price/socks5-fetch"]
+# Local Wcash and Zcash QA networks. Development consumers opt in.
+regtest = []
 testutils = [
     "perspective",
     "portpicker",
+    "regtest",
     "zingo_test_vectors",
     "tempfile",
     "pepper-sync/test-features",

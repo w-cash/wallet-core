@@ -82,7 +82,7 @@ zcash_primitives = { version = "0.30.0", features = ["non-standard-fees"] }
 zcash_proofs = "0.30.0"
 zcash_protocol = "0.10.4" # public API (TODO: remove from public API)
 zcash_transparent = "0.10.0"
-wcash-wallet = { git = "https://github.com/w-cash/wolf.git", rev = "9a9c0668784117f116d5b69bdb3a090765092343" }
+wcash-wallet = { git = "https://github.com/w-cash/wolf.git", rev = "b44571035074900570ef13f4fa96787886674ada" }
 
 ### Blockchain Protocol
 bip0039 = { version = "0.14", features = ["rand"] }
