@@ -10,11 +10,15 @@
 //! Run the opt-in public endpoint attestation with:
 //! `cargo test -p zingolib --lib wcash::tests::live_testnet_endpoint_attests -- --ignored --exact`.
 
+use std::io;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretVec;
 use serde::Serialize;
 use thiserror::Error;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 #[cfg(feature = "regtest")]
 use wcash_wallet::wallet_balance_with_confirmations;
 use wcash_wallet::{
@@ -42,6 +46,15 @@ const WCASH_TESTNET_NETWORK_LABEL: &str = "Wcash Testnet";
 const WCASH_TESTNET_GENESIS_DISPLAY: &str =
     "0271b5b0a10b2838f43cccdec9ca2f72aa72a7c103830082bac8f82f47f0593a";
 const WCASH_TESTNET_STORAGE_NAMESPACE: &str = "wcashtestnet-v5";
+const WCASH_MAINNET_TICKER: &str = "WEC";
+const WCASH_MAINNET_NETWORK_LABEL: &str = "Wcash Mainnet";
+const WCASH_MAINNET_GENESIS_DISPLAY: &str =
+    "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48";
+const WCASH_MAINNET_STORAGE_NAMESPACE: &str = "wcashmainnet-v1";
+const WCASH_MAINNET_BIRTHDAY: u32 = 1;
+const WCASH_MAINNET_ENDPOINT: &str = "http://mainnet.zecwec.com:48234";
+const WCASH_MAINNET_HOST: &str = "mainnet.zecwec.com";
+const WCASH_MAINNET_PORT: u16 = 48234;
 const WCASH_TESTNET_DEFAULT_ENDPOINT: &str = "https://wallet-testnet.wcashexplorer.com:443";
 const PUBLIC_CONFIRMATIONS: u32 = 100;
 #[cfg(feature = "regtest")]
@@ -70,9 +83,71 @@ const ALLOW_UNSAFE_LOCAL_CONFIRMATIONS: bool = true;
 
 /// The Wcash Testnet identity accepted by this release.
 ///
-/// Every runtime operation selects this frozen Testnet identity.
+/// Every runtime operation selects the identity of its profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WcashTestnet;
+
+/// The frozen Wcash Mainnet identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WcashMainnet;
+
+impl WcashMainnet {
+    pub const fn network(self) -> WalletNetwork {
+        WalletNetwork::Mainnet
+    }
+
+    pub const fn ticker(self) -> &'static str {
+        WCASH_MAINNET_TICKER
+    }
+
+    pub const fn network_label(self) -> &'static str {
+        WCASH_MAINNET_NETWORK_LABEL
+    }
+
+    pub const fn genesis_hash_display(self) -> &'static str {
+        WCASH_MAINNET_GENESIS_DISPLAY
+    }
+
+    pub fn genesis_hash(self) -> [u8; 32] {
+        self.network().genesis_hash()
+    }
+
+    pub fn branch_id(self) -> u32 {
+        self.network().branch_id().into()
+    }
+
+    pub const fn storage_namespace(self) -> &'static str {
+        WCASH_MAINNET_STORAGE_NAMESPACE
+    }
+
+    pub const fn required_confirmations(self) -> u32 {
+        PUBLIC_CONFIRMATIONS
+    }
+}
+
+pub trait WcashPublicProfile: Copy + std::fmt::Debug {
+    fn network() -> WalletNetwork;
+
+    fn new_wallet_birthday() -> Option<u32> {
+        None
+    }
+}
+
+impl WcashPublicProfile for WcashMainnet {
+    fn network() -> WalletNetwork {
+        WalletNetwork::Mainnet
+    }
+
+    fn new_wallet_birthday() -> Option<u32> {
+        Some(WCASH_MAINNET_BIRTHDAY)
+    }
+}
+
+impl WcashPublicProfile for WcashTestnet {
+    fn network() -> WalletNetwork {
+        WalletNetwork::Testnet
+    }
+}
 
 impl WcashTestnet {
     /// Returns the Wcash backend network selected by this profile.
@@ -223,6 +298,8 @@ impl From<WcashTestnetPayment> for TransferRecipient {
     }
 }
 
+pub type WcashMainnetPayment = WcashTestnetPayment;
+
 /// A shielded payment passed to [`WcashRegtestRuntime::send`].
 #[cfg(feature = "regtest")]
 pub type WcashRegtestPayment = WcashTestnetPayment;
@@ -245,6 +322,8 @@ impl From<WalletInfo> for WcashTestnetReceivers {
     }
 }
 
+pub type WcashMainnetReceivers = WcashTestnetReceivers;
+
 /// The receiving addresses for one local Wcash Regtest account.
 #[cfg(feature = "regtest")]
 pub type WcashRegtestReceivers = WcashTestnetReceivers;
@@ -255,6 +334,8 @@ pub enum WcashTestnetRuntimeError {
     /// Endpoint connection, attestation, or broadcast failure.
     #[error(transparent)]
     Rpc(#[from] WalletRpcError),
+    #[error("Wcash Mainnet transport failed: {0}")]
+    Transport(#[from] io::Error),
     /// Persistent wallet operation failure.
     #[error(transparent)]
     Wallet(#[from] WalletServiceError),
@@ -269,6 +350,52 @@ pub enum WcashTestnetRuntimeError {
     SignedTransactionMetadataMismatch,
 }
 
+pub type WcashMainnetRuntimeError = WcashTestnetRuntimeError;
+
+#[derive(Debug)]
+pub struct WcashMainnetRelay(JoinHandle<()>);
+
+impl WcashMainnetRelay {
+    async fn start() -> io::Result<(Self, String)> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let task = tokio::spawn(async move {
+            while let Ok((mut local, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut remote) =
+                        TcpStream::connect((WCASH_MAINNET_HOST, WCASH_MAINNET_PORT)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+                    }
+                });
+            }
+        });
+        Ok((Self(task), endpoint))
+    }
+}
+
+impl Drop for WcashMainnetRelay {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub async fn attested_public_client(
+    endpoint: &str,
+    network: WalletNetwork,
+) -> Result<(AttestedWcashClient, Option<WcashMainnetRelay>), WcashTestnetRuntimeError> {
+    let relay = if network == WalletNetwork::Mainnet && endpoint == WCASH_MAINNET_ENDPOINT {
+        Some(WcashMainnetRelay::start().await?)
+    } else {
+        None
+    };
+    let target = relay
+        .as_ref()
+        .map_or(endpoint, |(_, target)| target.as_str());
+    let client = AttestedWcashClient::connect(target, network).await?;
+    Ok((client, relay.map(|(guard, _)| guard)))
+}
+
 /// Errors from the local Wcash Regtest runtime boundary.
 #[cfg(feature = "regtest")]
 pub type WcashRegtestRuntimeError = WcashTestnetRuntimeError;
@@ -279,22 +406,27 @@ pub type WcashRegtestRuntimeError = WcashTestnetRuntimeError;
 /// synchronization is a restartable one-shot call. Balance reads fail closed
 /// while the backend's durable transparent recovery marker is incomplete.
 #[derive(Debug)]
-pub struct WcashTestnetRuntime {
+pub struct WcashPublicRuntime<P: WcashPublicProfile> {
     wallet_path: PathBuf,
     client: AttestedWcashClient,
+    _relay: Option<WcashMainnetRelay>,
+    profile: PhantomData<P>,
 }
 
-impl WcashTestnetRuntime {
-    /// Creates one new account near the current attested Testnet tip.
+pub type WcashTestnetRuntime = WcashPublicRuntime<WcashTestnet>;
+pub type WcashMainnetRuntime = WcashPublicRuntime<WcashMainnet>;
+
+impl<P: WcashPublicProfile> WcashPublicRuntime<P> {
+    /// Creates one new account near the current attested chain tip.
     pub async fn create(
         endpoint: &str,
         wallet_path: impl AsRef<Path>,
         master_seed: &SecretVec<u8>,
     ) -> Result<(Self, InitializedWallet), WcashTestnetRuntimeError> {
-        Self::initialize(endpoint, wallet_path, master_seed, None).await
+        Self::initialize(endpoint, wallet_path, master_seed, P::new_wallet_birthday()).await
     }
 
-    /// Restores one account from an explicit Testnet birthday height.
+    /// Restores one account from an explicit birthday height.
     pub async fn restore(
         endpoint: &str,
         wallet_path: impl AsRef<Path>,
@@ -304,7 +436,7 @@ impl WcashTestnetRuntime {
         Self::initialize(endpoint, wallet_path, master_seed, Some(birthday_height)).await
     }
 
-    /// Opens an existing account and attests its Testnet endpoint.
+    /// Opens an existing account and attests its endpoint.
     ///
     /// Inspection is read-only and uses public account metadata. The caller
     /// supplies spending authority only to [`Self::send`].
@@ -320,7 +452,7 @@ impl WcashTestnetRuntime {
 
     /// Reads public account metadata through a read-only database handle.
     pub fn inspect(wallet_path: impl AsRef<Path>) -> Result<WalletInfo, WcashTestnetRuntimeError> {
-        inspect_wallet(wallet_path, WcashTestnet.network()).map_err(Into::into)
+        inspect_wallet(wallet_path, P::network()).map_err(Into::into)
     }
 
     /// Returns the database path owned by this runtime.
@@ -336,7 +468,7 @@ impl WcashTestnetRuntime {
         synchronize_wallet_cancellable(
             &mut self.client,
             &self.wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             wcash_wallet::MAX_SYNC_BATCH_SIZE,
             cancellation,
         )
@@ -353,7 +485,7 @@ impl WcashTestnetRuntime {
     pub fn read_balance(
         wallet_path: impl AsRef<Path>,
     ) -> Result<WalletBalanceSummary, WcashTestnetRuntimeError> {
-        wallet_balance(wallet_path, WcashTestnet.network()).map_err(Into::into)
+        wallet_balance(wallet_path, P::network()).map_err(Into::into)
     }
 
     /// Reads newest-first confirmed transaction metadata at the exact synchronized tip.
@@ -369,8 +501,7 @@ impl WcashTestnetRuntime {
         wallet_path: impl AsRef<Path>,
         limit: usize,
     ) -> Result<ConfirmedTransactionHistory, WcashTestnetRuntimeError> {
-        confirmed_transaction_history(wallet_path, WcashTestnet.network(), limit)
-            .map_err(Into::into)
+        confirmed_transaction_history(wallet_path, P::network(), limit).map_err(Into::into)
     }
 
     /// Reads confirmed transaction metadata and wallet-display values.
@@ -386,8 +517,7 @@ impl WcashTestnetRuntime {
         wallet_path: impl AsRef<Path>,
         limit: usize,
     ) -> Result<ConfirmedTransactionSummaryHistory, WcashTestnetRuntimeError> {
-        confirmed_transaction_summary_history(wallet_path, WcashTestnet.network(), limit)
-            .map_err(Into::into)
+        confirmed_transaction_summary_history(wallet_path, P::network(), limit).map_err(Into::into)
     }
 
     /// Reads the account's canonical receiving addresses.
@@ -408,7 +538,7 @@ impl WcashTestnetRuntime {
         create_signed_transfer(
             &mut self.client,
             &self.wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             master_seed,
             recipients,
             PUBLIC_CONFIRMATIONS,
@@ -427,7 +557,7 @@ impl WcashTestnetRuntime {
     ) -> Result<StagedTransactionProposal, WcashTestnetRuntimeError> {
         propose_transfer_offline(
             wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             payments.into_iter().map(Into::into).collect(),
             PUBLIC_CONFIRMATIONS,
             ALLOW_UNSAFE_REGTEST_CONFIRMATIONS,
@@ -443,7 +573,7 @@ impl WcashTestnetRuntime {
     ) -> Result<StagedTransactionProposal, WcashTestnetRuntimeError> {
         propose_coinbase_shielding_offline(
             wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             DEFAULT_COINBASE_INPUTS,
             DEFAULT_EXPIRY_DELTA,
             DEFAULT_LOCK_FOR_BLOCKS,
@@ -457,7 +587,7 @@ impl WcashTestnetRuntime {
         master_seed: &SecretVec<u8>,
         staged: &StagedTransactionProposal,
     ) -> Result<CalculatedTransaction, WcashTestnetRuntimeError> {
-        calculate_staged_transaction(wallet_path, WcashTestnet.network(), master_seed, staged)
+        calculate_staged_transaction(wallet_path, P::network(), master_seed, staged)
             .map_err(Into::into)
     }
 
@@ -466,7 +596,7 @@ impl WcashTestnetRuntime {
         wallet_path: impl AsRef<Path>,
         staged: &StagedTransactionProposal,
     ) -> Result<(), WcashTestnetRuntimeError> {
-        cancel_staged_transaction(wallet_path, WcashTestnet.network(), staged).map_err(Into::into)
+        cancel_staged_transaction(wallet_path, P::network(), staged).map_err(Into::into)
     }
 
     /// Shields mature transparent coinbase outputs into Ironwood.
@@ -481,7 +611,7 @@ impl WcashTestnetRuntime {
         create_signed_coinbase_shielding(
             &mut self.client,
             &self.wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             master_seed,
             DEFAULT_COINBASE_INPUTS,
             DEFAULT_EXPIRY_DELTA,
@@ -501,6 +631,7 @@ impl WcashTestnetRuntime {
             &signed.branch_id,
             signed.expiry_height,
             &signed.raw_transaction_hex,
+            P::network(),
         )?;
         self.client
             .broadcast_raw_transaction(raw)
@@ -524,13 +655,8 @@ impl WcashTestnetRuntime {
         after_row_id: Option<u64>,
         limit: usize,
     ) -> Result<PendingSignedTransactionPage, WcashTestnetRuntimeError> {
-        pending_signed_transactions(
-            &self.wallet_path,
-            WcashTestnet.network(),
-            after_row_id,
-            limit,
-        )
-        .map_err(Into::into)
+        pending_signed_transactions(&self.wallet_path, P::network(), after_row_id, limit)
+            .map_err(Into::into)
     }
 
     /// Lists only transactions that remain valid at an internally attested
@@ -547,7 +673,7 @@ impl WcashTestnetRuntime {
     ) -> Result<PendingSignedTransactionPage, WcashTestnetRuntimeError> {
         active_pending_signed_transactions(
             &self.wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             expected_tip,
             after_row_id,
             limit,
@@ -564,7 +690,7 @@ impl WcashTestnetRuntime {
     ) -> Result<PendingSignedTransactionPage, WcashTestnetRuntimeError> {
         active_pending_signed_transactions(
             wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             expected_tip,
             after_row_id,
             limit,
@@ -582,6 +708,7 @@ impl WcashTestnetRuntime {
             &signed.branch_id,
             signed.expiry_height,
             &signed.raw_transaction_hex,
+            P::network(),
         )?;
         self.client
             .broadcast_raw_transaction(raw)
@@ -600,7 +727,7 @@ impl WcashTestnetRuntime {
         let initialized = initialize_wallet(
             &mut runtime.client,
             &runtime.wallet_path,
-            WcashTestnet.network(),
+            P::network(),
             master_seed,
             birthday_height,
         )
@@ -616,10 +743,12 @@ impl WcashTestnetRuntime {
         endpoint: &str,
         wallet_path: PathBuf,
     ) -> Result<Self, WcashTestnetRuntimeError> {
-        let client = AttestedWcashClient::connect(endpoint, WcashTestnet.network()).await?;
+        let (client, relay) = attested_public_client(endpoint, P::network()).await?;
         Ok(Self {
             wallet_path,
             client,
+            _relay: relay,
+            profile: PhantomData,
         })
     }
 }
@@ -975,13 +1104,14 @@ fn validate_signed_bytes(
     branch_id: &str,
     expiry_height: u32,
     raw_transaction_hex: &str,
+    network: WalletNetwork,
 ) -> Result<Vec<u8>, WcashTestnetRuntimeError> {
-    if branch_id != WcashTestnet.network().branch_id_hex() {
+    if branch_id != network.branch_id_hex() {
         return Err(WcashTestnetRuntimeError::SignedTransactionMetadataMismatch);
     }
     let raw = hex::decode(raw_transaction_hex)
         .map_err(WcashTestnetRuntimeError::InvalidSignedTransactionHex)?;
-    let transaction = inspect_signed_transaction(&raw, WcashTestnet.network())?;
+    let transaction = inspect_signed_transaction(&raw, network)?;
     let actual_expiry_height = u32::from(transaction.expiry_height());
     if transaction.txid().to_string() != expected_txid || actual_expiry_height != expiry_height {
         return Err(WcashTestnetRuntimeError::SignedTransactionMetadataMismatch);
@@ -1016,6 +1146,7 @@ mod tests {
     use super::*;
 
     const WCASH_TESTNET_BRANCH_ID: u32 = 0xb3cf_d27e;
+    const WCASH_MAINNET_BRANCH_ID: u32 = 0xd9c6_a7ee;
     #[cfg(feature = "regtest")]
     const WCASH_REGTEST_BRANCH_ID: u32 = 0xc3a6_678a;
     const ZCASH_TESTNET_STORAGE_NAMESPACE: &str = "testnet3";
@@ -1051,6 +1182,32 @@ mod tests {
         assert_eq!(profile.default_endpoint(), PUBLIC_TESTNET_ENDPOINT);
         assert_eq!(profile.required_confirmations(), PUBLIC_CONFIRMATIONS);
         profile.validate_recipient(FIXED_TESTNET_RECIPIENT).unwrap();
+    }
+
+    #[test]
+    fn mainnet_identity_is_disjoint_from_testnet() {
+        let profile = WcashMainnet;
+        let mut genesis_hash_display = profile.genesis_hash();
+        genesis_hash_display.reverse();
+
+        assert_eq!(profile.network(), WalletNetwork::Mainnet);
+        assert_eq!(profile.ticker(), WCASH_MAINNET_TICKER);
+        assert_eq!(profile.branch_id(), WCASH_MAINNET_BRANCH_ID);
+        assert_eq!(
+            WcashMainnet::new_wallet_birthday(),
+            Some(WCASH_MAINNET_BIRTHDAY)
+        );
+        assert_eq!(
+            hex::encode(genesis_hash_display),
+            WCASH_MAINNET_GENESIS_DISPLAY
+        );
+        assert_eq!(profile.storage_namespace(), WCASH_MAINNET_STORAGE_NAMESPACE);
+        assert_ne!(profile.genesis_hash(), WcashTestnet.genesis_hash());
+        assert_ne!(
+            profile.storage_namespace(),
+            WcashTestnet.storage_namespace()
+        );
+        assert_ne!(profile.branch_id(), WcashTestnet.branch_id());
     }
 
     #[cfg(feature = "regtest")]
@@ -1217,6 +1374,29 @@ mod tests {
             WcashTestnetRuntimeError::Wallet(WalletServiceError::WalletDatabaseMissing)
         ));
         assert!(!wallet_path.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the public Wcash Mainnet endpoint"]
+    async fn live_mainnet_wallet_scans_from_block_one() {
+        use rand::RngCore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_path = directory.path().join("wallet.db");
+        let mut seed_bytes = vec![EMPTY_SEED_BYTE; MASTER_SEED_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut seed_bytes);
+        let master_seed = SecretVec::new(seed_bytes);
+        let (mut runtime, initialized) =
+            WcashMainnetRuntime::create(WCASH_MAINNET_ENDPOINT, &wallet_path, &master_seed)
+                .await
+                .unwrap();
+
+        assert_eq!(initialized.birthday_height, WCASH_MAINNET_BIRTHDAY);
+        assert!(initialized.address.starts_with("wu1"));
+        let synchronized = runtime.sync(&WalletSyncCancellation::new()).await.unwrap();
+        assert!(synchronized.synchronized);
+        assert!(synchronized.fully_scanned_height > 100);
+        assert_eq!(runtime.balance().unwrap(), synchronized);
     }
 
     #[tokio::test]

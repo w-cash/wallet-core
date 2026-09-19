@@ -604,7 +604,7 @@ fn launcher(arm: &Arm) -> Result<Command, Vec<String>> {
 
 /// The engine's own duration and output count, from the closing line.
 fn closing_span(log: &str) -> Option<(u64, u64)> {
-    let tail = log.split(SYNC_SPAN_CLOSE).nth(1)?;
+    let tail = log.rsplit_once(SYNC_SPAN_CLOSE)?.1;
     let digits: String = tail
         .trim_start()
         .chars()
@@ -883,5 +883,9 @@ mod tests {
         );
         assert_eq!(closing_span("SYNC_SPAN=close 12"), None);
         assert_eq!(closing_span("SYNC_SPAN=close 1250ms err\n"), None);
+        assert_eq!(
+            closing_span("SYNC_SPAN=close 1250ms ok\nSYNC_SPAN=close 1250ms ok outputs=8192\n"),
+            Some((1250, 8192))
+        );
     }
 }
