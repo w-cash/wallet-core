@@ -1127,7 +1127,7 @@ mod tests {
 
     use super::*;
 
-    const WCASH_TESTNET_BRANCH_ID: u32 = 0xb3cf_d27e;
+    const WCASH_TESTNET_BRANCH_ID: u32 = 0x54ba_2bfb;
     const WCASH_MAINNET_BRANCH_ID: u32 = 0xd9c6_a7ee;
     #[cfg(feature = "regtest")]
     const WCASH_REGTEST_BRANCH_ID: u32 = 0xc3a6_678a;
