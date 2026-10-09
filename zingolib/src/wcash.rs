@@ -134,7 +134,9 @@ impl WcashMainnet {
     }
 }
 
-fn wallet_activation_height(network: WalletNetwork) -> u32 {
+/// Returns the first height at which shielded wallet state can exist for the
+/// selected Wcash network, derived from its frozen consensus parameters.
+pub fn wallet_activation_height(network: WalletNetwork) -> u32 {
     network
         .parameters()
         .activation_height(NetworkUpgrade::Sapling)
