@@ -10,15 +10,12 @@
 //! Run the opt-in public endpoint attestation with:
 //! `cargo test -p zingolib --lib wcash::tests::live_testnet_endpoint_attests -- --ignored --exact`.
 
-use std::io;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretVec;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
 #[cfg(feature = "regtest")]
 use wcash_wallet::wallet_balance_with_confirmations;
 use wcash_wallet::{
@@ -40,6 +37,7 @@ pub use wcash_wallet::{
     StoredSignedTransaction, WalletAddressError, WalletBalanceSummary, WalletInfo,
     WalletSyncCancellation,
 };
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 const WCASH_TESTNET_TICKER: &str = "TWC";
 const WCASH_TESTNET_NETWORK_LABEL: &str = "Wcash Testnet";
@@ -51,10 +49,7 @@ const WCASH_MAINNET_NETWORK_LABEL: &str = "Wcash Mainnet";
 const WCASH_MAINNET_GENESIS_DISPLAY: &str =
     "5bae12c8662a577b04ce1591af1a137c128f0cb51018a5f1622d861d1bb6fc48";
 const WCASH_MAINNET_STORAGE_NAMESPACE: &str = "wcashmainnet-v1";
-const WCASH_MAINNET_BIRTHDAY: u32 = 1;
-const WCASH_MAINNET_ENDPOINT: &str = "http://mainnet.zecwec.com:48234";
-const WCASH_MAINNET_HOST: &str = "mainnet.zecwec.com";
-const WCASH_MAINNET_PORT: u16 = 48234;
+const WCASH_MAINNET_ENDPOINT: &str = "https://mainnet.zecwec.com:443";
 const WCASH_TESTNET_DEFAULT_ENDPOINT: &str = "https://wallet-testnet.wcashexplorer.com:443";
 const PUBLIC_CONFIRMATIONS: u32 = 100;
 #[cfg(feature = "regtest")]
@@ -120,9 +115,33 @@ impl WcashMainnet {
         WCASH_MAINNET_STORAGE_NAMESPACE
     }
 
+    /// Returns the authenticated public compact-block endpoint for Mainnet.
+    pub const fn default_endpoint(self) -> &'static str {
+        WCASH_MAINNET_ENDPOINT
+    }
+
     pub const fn required_confirmations(self) -> u32 {
         PUBLIC_CONFIRMATIONS
     }
+
+    /// Returns the first height at which Wcash shielded wallet state can exist.
+    ///
+    /// This is deliberately derived from the selected Wcash consensus
+    /// parameters. Routing through Zcash Mainnet parameters would incorrectly
+    /// return height 419200.
+    pub fn wallet_activation_height(self) -> u32 {
+        wallet_activation_height(self.network())
+    }
+}
+
+/// Returns the first height at which shielded wallet state can exist for the
+/// selected Wcash network, derived from its frozen consensus parameters.
+pub fn wallet_activation_height(network: WalletNetwork) -> u32 {
+    network
+        .parameters()
+        .activation_height(NetworkUpgrade::Sapling)
+        .map(u32::from)
+        .expect("supported Wcash networks activate Sapling")
 }
 
 pub trait WcashPublicProfile: Copy + std::fmt::Debug {
@@ -139,7 +158,9 @@ impl WcashPublicProfile for WcashMainnet {
     }
 
     fn new_wallet_birthday() -> Option<u32> {
-        Some(WCASH_MAINNET_BIRTHDAY)
+        Some(wallet_activation_height(
+            <Self as WcashPublicProfile>::network(),
+        ))
     }
 }
 
@@ -334,8 +355,6 @@ pub enum WcashTestnetRuntimeError {
     /// Endpoint connection, attestation, or broadcast failure.
     #[error(transparent)]
     Rpc(#[from] WalletRpcError),
-    #[error("Wcash Mainnet transport failed: {0}")]
-    Transport(#[from] io::Error),
     /// Persistent wallet operation failure.
     #[error(transparent)]
     Wallet(#[from] WalletServiceError),
@@ -352,48 +371,13 @@ pub enum WcashTestnetRuntimeError {
 
 pub type WcashMainnetRuntimeError = WcashTestnetRuntimeError;
 
-#[derive(Debug)]
-pub struct WcashMainnetRelay(JoinHandle<()>);
-
-impl WcashMainnetRelay {
-    async fn start() -> io::Result<(Self, String)> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-        let endpoint = format!("http://{}", listener.local_addr()?);
-        let task = tokio::spawn(async move {
-            while let Ok((mut local, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    if let Ok(mut remote) =
-                        TcpStream::connect((WCASH_MAINNET_HOST, WCASH_MAINNET_PORT)).await
-                    {
-                        let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
-                    }
-                });
-            }
-        });
-        Ok((Self(task), endpoint))
-    }
-}
-
-impl Drop for WcashMainnetRelay {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 pub async fn attested_public_client(
     endpoint: &str,
     network: WalletNetwork,
-) -> Result<(AttestedWcashClient, Option<WcashMainnetRelay>), WcashTestnetRuntimeError> {
-    let relay = if network == WalletNetwork::Mainnet && endpoint == WCASH_MAINNET_ENDPOINT {
-        Some(WcashMainnetRelay::start().await?)
-    } else {
-        None
-    };
-    let target = relay
-        .as_ref()
-        .map_or(endpoint, |(_, target)| target.as_str());
-    let client = AttestedWcashClient::connect(target, network).await?;
-    Ok((client, relay.map(|(guard, _)| guard)))
+) -> Result<AttestedWcashClient, WcashTestnetRuntimeError> {
+    AttestedWcashClient::connect(endpoint, network)
+        .await
+        .map_err(Into::into)
 }
 
 /// Errors from the local Wcash Regtest runtime boundary.
@@ -409,7 +393,6 @@ pub type WcashRegtestRuntimeError = WcashTestnetRuntimeError;
 pub struct WcashPublicRuntime<P: WcashPublicProfile> {
     wallet_path: PathBuf,
     client: AttestedWcashClient,
-    _relay: Option<WcashMainnetRelay>,
     profile: PhantomData<P>,
 }
 
@@ -743,11 +726,10 @@ impl<P: WcashPublicProfile> WcashPublicRuntime<P> {
         endpoint: &str,
         wallet_path: PathBuf,
     ) -> Result<Self, WcashTestnetRuntimeError> {
-        let (client, relay) = attested_public_client(endpoint, P::network()).await?;
+        let client = attested_public_client(endpoint, P::network()).await?;
         Ok(Self {
             wallet_path,
             client,
-            _relay: relay,
             profile: PhantomData,
         })
     }
@@ -1145,7 +1127,7 @@ mod tests {
 
     use super::*;
 
-    const WCASH_TESTNET_BRANCH_ID: u32 = 0xb3cf_d27e;
+    const WCASH_TESTNET_BRANCH_ID: u32 = 0x54ba_2bfb;
     const WCASH_MAINNET_BRANCH_ID: u32 = 0xd9c6_a7ee;
     #[cfg(feature = "regtest")]
     const WCASH_REGTEST_BRANCH_ID: u32 = 0xc3a6_678a;
@@ -1193,9 +1175,11 @@ mod tests {
         assert_eq!(profile.network(), WalletNetwork::Mainnet);
         assert_eq!(profile.ticker(), WCASH_MAINNET_TICKER);
         assert_eq!(profile.branch_id(), WCASH_MAINNET_BRANCH_ID);
+        assert_eq!(profile.default_endpoint(), "https://mainnet.zecwec.com:443");
+        assert_eq!(profile.wallet_activation_height(), 1);
         assert_eq!(
             WcashMainnet::new_wallet_birthday(),
-            Some(WCASH_MAINNET_BIRTHDAY)
+            Some(WcashMainnet.wallet_activation_height())
         );
         assert_eq!(
             hex::encode(genesis_hash_display),
@@ -1208,6 +1192,19 @@ mod tests {
             WcashTestnet.storage_namespace()
         );
         assert_ne!(profile.branch_id(), WcashTestnet.branch_id());
+    }
+
+    #[tokio::test]
+    async fn mainnet_plaintext_endpoint_is_rejected_without_fallback() {
+        let error =
+            attested_public_client("http://mainnet.zecwec.com:48234", WalletNetwork::Mainnet)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WcashTestnetRuntimeError::Rpc(WalletRpcError::InsecureEndpoint)
+        ));
     }
 
     #[cfg(feature = "regtest")]
@@ -1391,7 +1388,10 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(initialized.birthday_height, WCASH_MAINNET_BIRTHDAY);
+        assert_eq!(
+            initialized.birthday_height,
+            WcashMainnet.wallet_activation_height()
+        );
         assert!(initialized.address.starts_with("wu1"));
         let synchronized = runtime.sync(&WalletSyncCancellation::new()).await.unwrap();
         assert!(synchronized.synchronized);
