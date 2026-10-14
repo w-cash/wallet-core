@@ -52,6 +52,9 @@ impl LightClient {
         let (progress_sender, progress_receiver) = tokio::sync::watch::channel(None);
         self.sync_progress = progress_receiver;
         let sync_handle = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            tracing::info!("SYNC_SPAN=open");
+            let outcome = {
             // The engine times its own span, so a measurement reads one
             // clock inside the task that does the work rather than polling
             // a status or watching a prompt redraw.
@@ -71,6 +74,19 @@ impl LightClient {
                 started.elapsed().as_millis(),
                 if outcome.is_ok() { "ok" } else { "err" }
             );
+            outcome
+        };
+            let elapsed = started.elapsed().as_millis();
+            match &outcome {
+                Ok(result) => tracing::info!(
+                    "SYNC_SPAN=close {}ms ok outputs={}",
+                    elapsed,
+                    u64::from(result.sapling_outputs_scanned)
+                        + u64::from(result.orchard_outputs_scanned)
+                        + u64::from(result.ironwood_outputs_scanned)
+                ),
+                Err(_) => tracing::info!("SYNC_SPAN=close {}ms err", elapsed),
+            }
             outcome
         });
         self.sync_handle = Some(sync_handle);
